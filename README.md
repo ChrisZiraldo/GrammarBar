@@ -1,6 +1,6 @@
 # GrammarBar
 
-A macOS menu-bar app that watches your focused text field, streams a grammar and spelling correction through a local LLM (via llama.cpp), and shows a floating overlay near the field. Pressing **Enter** sends your original text untouched. Clicking **Accept** overwrites the field with the corrected version.
+A macOS menu-bar app that watches your focused text field, streams a grammar and spelling correction through a local LLM (via llama.cpp), and shows a floating overlay near the field. Pressing **Enter** sends your original text untouched. Pressing **⌃Return (Ctrl+Return)** or clicking **Accept** overwrites the field with the corrected version.
 
 Everything runs locally — no text leaves your machine.
 
@@ -43,11 +43,12 @@ Then:
 
 ## Using GrammarBar
 
-- Type normally in any native macOS text field.
-- After you pause (~0.4 seconds), a floating overlay appears near the field showing the corrected text streaming in.
-- **Enter / Tab / click elsewhere** — sends your original text, overlay disappears.
-- **Click Accept** in the overlay — your text is replaced with the correction.
-- **Click ✕** or start typing again — dismisses the overlay.
+- Type normally in any supported text field.
+- After you pause (~0.4 seconds by default; adjustable in Settings → General), a floating overlay appears below the menu-bar icon showing the corrected text streaming in.
+- **Press Return, or keep typing** — sends/inserts your original text as usual and dismisses the overlay.
+- **Press ⌃Return (Ctrl+Return), or click Accept** in the overlay — replaces your field's text with the correction.
+- **Click ✕** — dismisses the overlay without accepting.
+- Switching to a different app hides the overlay automatically, but clicking into another field in the *same* app does not — it stays put until you type, press Return, or click ✕.
 
 ## Model catalog
 
@@ -117,3 +118,4 @@ For personal use, run unsigned from Xcode. For distribution:
 - No telemetry, no network calls except the HuggingFace model download.
 - The HuggingFace download is a direct HTTPS fetch; no account required for public models.
 - GrammarBar never stores or logs your typed text.
+- Secure/password text fields are always skipped — GrammarBar never reads their contents.
