@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.grammarbar.app</string>
+    <key>CFBundleName</key>
+    <string>GrammarBar</string>
+    <key>CFBundleDisplayName</key>
+    <string>GrammarBar</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>GrammarBar reads the text from your focused text field and writes the corrected version back.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>GrammarBar monitors the frontmost application to detect which text field is active.</string>
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>GrammarBar monitors keystrokes to know when you pause typing so it can suggest corrections.</string>
+</dict>
+</plist>

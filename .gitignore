@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode build output
+build/
+DerivedData/
+*.xcresult
+
+# XcodeGen-generated project (regenerate with `xcodegen generate` or `bash scripts/setup.sh`)
+GrammarBar.xcodeproj/
+
+# Xcode per-user state (relevant if the project file above is ever tracked)
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Bundled llama-server binary + dylibs (fetched/bundled by scripts/setup.sh, not source)
+Sources/GrammarBar/Resources/llama-server
+Sources/GrammarBar/Resources/*.dylib
+
+# Misc
+*.swp

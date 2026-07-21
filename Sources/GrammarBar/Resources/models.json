@@ -1,0 +1,62 @@
+[
+  {
+    "id": "qwen2.5-1.5b",
+    "name": "Qwen2.5-1.5B Instruct",
+    "description": "Fastest model. Best for quick grammar fixes with minimal RAM.",
+    "hfRepo": "bartowski/Qwen2.5-1.5B-Instruct-GGUF",
+    "filename": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+    "downloadURL": "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+    "sizeMB": 986,
+    "minRAMGB": 4,
+    "chatTemplate": "chatml",
+    "isRecommended": false
+  },
+  {
+    "id": "gemma-2-2b",
+    "name": "Gemma 2 2B Instruct",
+    "description": "Recommended. Excellent grammar and clarity improvements at high speed.",
+    "hfRepo": "bartowski/gemma-2-2b-it-GGUF",
+    "filename": "gemma-2-2b-it-Q4_K_M.gguf",
+    "downloadURL": "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf",
+    "sizeMB": 1668,
+    "minRAMGB": 4,
+    "chatTemplate": "gemma",
+    "isRecommended": true
+  },
+  {
+    "id": "qwen2.5-3b",
+    "name": "Qwen2.5-3B Instruct",
+    "description": "Balanced quality and speed. Good rewrites with moderate RAM.",
+    "hfRepo": "bartowski/Qwen2.5-3B-Instruct-GGUF",
+    "filename": "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+    "downloadURL": "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+    "sizeMB": 1879,
+    "minRAMGB": 6,
+    "chatTemplate": "chatml",
+    "isRecommended": false
+  },
+  {
+    "id": "llama-3.2-3b",
+    "name": "Llama 3.2 3B Instruct",
+    "description": "Meta's compact Llama. Strong grammar and style corrections.",
+    "hfRepo": "bartowski/Llama-3.2-3B-Instruct-GGUF",
+    "filename": "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+    "downloadURL": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+    "sizeMB": 2017,
+    "minRAMGB": 6,
+    "chatTemplate": "llama3",
+    "isRecommended": false
+  },
+  {
+    "id": "phi-3.5-mini",
+    "name": "Phi-3.5 Mini Instruct",
+    "description": "Highest quality rewrites. Best results for complex sentences.",
+    "hfRepo": "bartowski/Phi-3.5-mini-instruct-GGUF",
+    "filename": "Phi-3.5-mini-instruct-Q4_K_M.gguf",
+    "downloadURL": "https://huggingface.co/bartowski/Phi-3.5-mini-instruct-GGUF/resolve/main/Phi-3.5-mini-instruct-Q4_K_M.gguf",
+    "sizeMB": 2393,
+    "minRAMGB": 8,
+    "chatTemplate": "phi3",
+    "isRecommended": false
+  }
+]

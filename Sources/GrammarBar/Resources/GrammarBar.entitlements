@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        No app-sandbox: CGEventTap and AXUIElement require non-sandboxed execution.
+        Hardened Runtime is enabled (ENABLE_HARDENED_RUNTIME=YES in build settings).
+        The user must grant Accessibility and Input Monitoring in System Settings.
+    -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <false/>
+    <!--
+        Our self-signed local dev certificate has no Apple Team ID, so the
+        hardened runtime's default library validation would refuse to load our
+        own (identically self-signed) bundled dylibs, treating them as a "Team
+        ID mismatch". Disabling validation for this local dev cert is safe since
+        we're not distributing this build.
+    -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
