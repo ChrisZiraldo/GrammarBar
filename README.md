@@ -1,6 +1,6 @@
 # GrammarBar
 
-A macOS menu-bar app that watches your focused text field, streams a grammar and spelling correction through a local LLM (via llama.cpp), and shows a floating overlay near the field. Pressing **Enter** sends your original text untouched. Pressing **⌃Return (Ctrl+Return)** or clicking **Accept** overwrites the field with the corrected version.
+A macOS menu-bar app that watches your focused text field, streams a grammar and spelling correction through a local LLM (via llama.cpp), and shows the suggestion in a floating speech-bubble anchored below the menu-bar icon. Pressing **Enter** sends your original text untouched. Pressing **⌃Return (Ctrl+Return)** or clicking **Accept** overwrites the field with the corrected version.
 
 Everything runs locally — no text leaves your machine.
 
