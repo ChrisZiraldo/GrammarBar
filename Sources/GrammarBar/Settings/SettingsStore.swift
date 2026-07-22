@@ -16,6 +16,12 @@ final class SettingsStore: ObservableObject {
         didSet { UserDefaults.standard.set(debounceInterval, forKey: "debounceInterval") }
     }
 
+    /// When enabled, the correction bubble grows to fit long suggestions instead of
+    /// scrolling internally within a fixed height.
+    @Published var resizeBubbleToFitText: Bool {
+        didSet { UserDefaults.standard.set(resizeBubbleToFitText, forKey: "resizeBubbleToFitText") }
+    }
+
     /// When enabled, corrections are limited to spelling, grammar, and punctuation —
     /// the model is instructed not to reword or rephrase the text otherwise.
     @Published var proofreadOnly: Bool {
@@ -35,6 +41,7 @@ final class SettingsStore: ObservableObject {
         isEnabled = defaults.object(forKey: "isEnabled") as? Bool ?? true
         selectedModelId = defaults.string(forKey: "selectedModelId")
         debounceInterval = defaults.object(forKey: "debounceInterval") as? Double ?? 0.4
+        resizeBubbleToFitText = defaults.object(forKey: "resizeBubbleToFitText") as? Bool ?? false
         proofreadOnly = defaults.object(forKey: "proofreadOnly") as? Bool ?? false
         let arr = defaults.array(forKey: "blockedBundleIds") as? [String] ?? []
         blockedBundleIds = Set(arr)
