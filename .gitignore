@@ -8,6 +8,9 @@ build/
 DerivedData/
 *.xcresult
 
+# Distribution output (scripts/dist.sh)
+dist/
+
 # XcodeGen-generated project (regenerate with `xcodegen generate` or `bash scripts/setup.sh`)
 GrammarBar.xcodeproj/
 

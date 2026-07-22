@@ -1,0 +1,70 @@
+name: Release
+
+# Cuts a GitHub Release whenever the top-level VERSION file changes on main.
+# Builds the ad-hoc–signed macOS app (scripts/dist.sh) and attaches the zip.
+#
+# NOTE: this build is NOT notarized (no Apple Developer ID). Recipients must
+# clear the quarantine flag / use "Open Anyway" — see OPEN-ME.txt in the zip.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "VERSION"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # macos-14 = Apple Silicon (arm64), which the bundled llama-server requires.
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need full history/tags to detect existing releases
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists — skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Will create release $TAG."
+          fi
+
+      - name: Bundle dependencies + generate project
+        if: steps.check.outputs.exists == 'false'
+        run: bash scripts/setup.sh
+
+      - name: Build ad-hoc distributable
+        if: steps.check.outputs.exists == 'false'
+        run: bash scripts/dist.sh
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          TAG="v${VERSION}"
+          gh release create "$TAG" \
+            "dist/GrammarBar-${VERSION}.zip" \
+            --target "${{ github.sha }}" \
+            --title "GrammarBar ${TAG}" \
+            --generate-notes
