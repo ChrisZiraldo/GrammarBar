@@ -4,6 +4,11 @@ options:
   bundleIdPrefix: com.grammarbar
   createIntermediateGroups: true
   xcodeVersion: "15.4"
+  # Pin the generated project's file format (objectVersion) to Xcode 15.3.
+  # Without this, xcodegen defaults to the newest format it knows (Xcode 16,
+  # objectVersion 77), which the GitHub Actions macos-14 runner's default
+  # Xcode (15.4) cannot open: "future Xcode project file format (77)".
+  projectFormat: xcode15_3
 
 settings:
   base:
