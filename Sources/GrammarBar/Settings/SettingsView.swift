@@ -220,6 +220,17 @@ private struct GeneralTab: View {
             }
 
             Section {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Proofread only (no rewording)", isOn: $store.proofreadOnly)
+                    Text("When enabled, only spelling, grammar, and punctuation are fixed. The text is never reworded or restyled.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            } header: {
+                Text("Correction Style")
+            }
+
+            Section {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("One app bundle ID per line. Leave empty to enable in all apps.")
                         .font(.caption)

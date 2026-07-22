@@ -62,7 +62,7 @@ final class CorrectionEngine: ObservableObject {
         let port = serverManager.port
         currentTask = Task { [weak self] in
             guard let self else { return }
-            let client = LlamaClient(port: port)
+            let client = LlamaClient(port: port, proofreadOnly: SettingsStore.shared.proofreadOnly)
             do {
                 for try await token in client.correct(trimmed) {
                     if Task.isCancelled { return }

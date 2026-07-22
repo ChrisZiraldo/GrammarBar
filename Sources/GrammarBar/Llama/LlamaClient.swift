@@ -9,10 +9,22 @@ struct LlamaClient {
         Return ONLY the corrected text — no commentary, no quotes, no explanation, no preamble.
         """
 
-    let port: Int
+    private static let proofreadOnlySystemPrompt = """
+        You are a precise proofreader. \
+        Fix ONLY spelling mistakes, grammar errors, and punctuation errors. \
+        Do NOT reword, rephrase, restructure, or otherwise change any part of the text that is already correct. \
+        Do NOT improve style, clarity, tone, or word choice. \
+        Make the smallest possible edit that fixes the error — leave everything else exactly as written. \
+        Preserve the author's voice, style, and intent. \
+        Return ONLY the corrected text — no commentary, no quotes, no explanation, no preamble.
+        """
 
-    init(port: Int) {
+    let port: Int
+    let proofreadOnly: Bool
+
+    init(port: Int, proofreadOnly: Bool = false) {
         self.port = port
+        self.proofreadOnly = proofreadOnly
     }
 
     // Streams corrected tokens for the given input text.
@@ -28,7 +40,7 @@ struct LlamaClient {
                     let body: [String: Any] = [
                         "model": "local-model",
                         "messages": [
-                            ["role": "system", "content": Self.systemPrompt],
+                            ["role": "system", "content": self.proofreadOnly ? Self.proofreadOnlySystemPrompt : Self.systemPrompt],
                             ["role": "user", "content": text]
                         ],
                         "stream": true,
