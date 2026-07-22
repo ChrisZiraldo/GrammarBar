@@ -8,7 +8,6 @@ struct SettingsView: View {
     @ObservedObject private var serverManager: LlamaServerManager
     @State private var accessibilityGranted = false
     @State private var inputMonitoringGranted = false
-    @State private var allowListText = ""
     @State private var selectedTab = 0
 
     init(serverManager: LlamaServerManager) {
@@ -21,7 +20,7 @@ struct SettingsView: View {
                 .tabItem { Label("Models", systemImage: "cpu") }
                 .tag(0)
 
-            GeneralTab(store: store, allowListText: $allowListText)
+            GeneralTab(store: store)
                 .tabItem { Label("General", systemImage: "gearshape") }
                 .tag(1)
 
@@ -35,7 +34,6 @@ struct SettingsView: View {
         .frame(width: 520, height: 420)
         .onAppear {
             checkPermissions()
-            allowListText = store.allowedBundleIds.sorted().joined(separator: "\n")
             modelManager.refreshInstalledStates()
         }
     }
@@ -193,7 +191,7 @@ private struct ModelRow: View {
 
 private struct GeneralTab: View {
     @ObservedObject var store: SettingsStore
-    @Binding var allowListText: String
+    @State private var showingAppPicker = false
 
     var body: some View {
         Form {
@@ -232,28 +230,174 @@ private struct GeneralTab: View {
 
             Section {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("One app bundle ID per line. Leave empty to enable in all apps.")
+                    Text("GrammarBar is active everywhere except these apps.")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    TextEditor(text: $allowListText)
-                        .font(.system(size: 12, design: .monospaced))
-                        .frame(height: 80)
-                        .border(Color(NSColor.separatorColor), width: 0.5)
-                    Button("Save allow-list") {
-                        let ids = allowListText
-                            .components(separatedBy: .newlines)
-                            .map { $0.trimmingCharacters(in: .whitespaces) }
-                            .filter { !$0.isEmpty }
-                        store.allowedBundleIds = Set(ids)
+
+                    let blocked = store.blockedBundleIds.sorted()
+                    if blocked.isEmpty {
+                        Text("No apps blocked.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .padding(.vertical, 4)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(blocked, id: \.self) { bundleId in
+                                BlockedAppRow(bundleId: bundleId) {
+                                    store.blockedBundleIds.remove(bundleId)
+                                }
+                                if bundleId != blocked.last {
+                                    Divider()
+                                }
+                            }
+                        }
+                    }
+
+                    Button("Add App…") {
+                        showingAppPicker = true
                     }
                     .controlSize(.small)
                 }
             } header: {
-                Text("App allow-list")
+                Text("App block-list")
             }
         }
         .formStyle(.grouped)
         .padding(.top, 8)
+        .sheet(isPresented: $showingAppPicker) {
+            AppPickerSheet(blockedIds: $store.blockedBundleIds)
+        }
+    }
+}
+
+private struct BlockedAppRow: View {
+    let bundleId: String
+    let onRemove: () -> Void
+
+    var body: some View {
+        let app = InstalledAppsScanner.resolve(bundleId: bundleId)
+
+        HStack(spacing: 8) {
+            if let app {
+                Image(nsImage: app.icon)
+                    .resizable()
+                    .frame(width: 18, height: 18)
+            } else {
+                Image(systemName: "app.dashed")
+                    .frame(width: 18, height: 18)
+                    .foregroundColor(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 0) {
+                Text(app?.name ?? bundleId)
+                    .font(.system(size: 12))
+                if app != nil {
+                    Text(bundleId)
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            Spacer()
+
+            Button {
+                onRemove()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 3)
+    }
+}
+
+// MARK: - App picker sheet
+
+private struct AppPickerSheet: View {
+    @Binding var blockedIds: Set<String>
+    @Environment(\.dismiss) private var dismiss
+    @State private var apps: [InstalledApp] = []
+    @State private var isLoading = true
+    @State private var query = ""
+
+    private var filteredApps: [InstalledApp] {
+        guard !query.isEmpty else { return apps }
+        return apps.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Block an App")
+                    .font(.headline)
+                Spacer()
+                Button("Done") { dismiss() }
+            }
+            .padding([.horizontal, .top], 16)
+            .padding(.bottom, 8)
+
+            TextField("Search apps…", text: $query)
+                .textFieldStyle(.roundedBorder)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 10)
+
+            Divider()
+
+            if isLoading {
+                Spacer()
+                ProgressView("Scanning Applications folder…")
+                Spacer()
+            } else if filteredApps.isEmpty {
+                Spacer()
+                Text("No apps found.")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                Spacer()
+            } else {
+                List(filteredApps) { app in
+                    Button {
+                        toggle(app)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(nsImage: app.icon)
+                                .resizable()
+                                .frame(width: 22, height: 22)
+                            Text(app.name)
+                                .font(.system(size: 12))
+                            Spacer()
+                            if blockedIds.contains(app.bundleId) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.accentColor)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .frame(width: 380, height: 440)
+        .onAppear(perform: loadApps)
+    }
+
+    private func toggle(_ app: InstalledApp) {
+        if blockedIds.contains(app.bundleId) {
+            blockedIds.remove(app.bundleId)
+        } else {
+            blockedIds.insert(app.bundleId)
+        }
+    }
+
+    private func loadApps() {
+        guard apps.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let scanned = InstalledAppsScanner.scanAll()
+            DispatchQueue.main.async {
+                apps = scanned
+                isLoading = false
+            }
+        }
     }
 }
 

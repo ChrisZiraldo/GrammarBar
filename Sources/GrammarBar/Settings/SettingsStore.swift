@@ -22,11 +22,11 @@ final class SettingsStore: ObservableObject {
         didSet { UserDefaults.standard.set(proofreadOnly, forKey: "proofreadOnly") }
     }
 
-    /// Bundle IDs of apps where correction is active. Empty = all native apps.
-    @Published var allowedBundleIds: Set<String> {
+    /// Bundle IDs of apps where correction is disabled. Empty = active everywhere.
+    @Published var blockedBundleIds: Set<String> {
         didSet {
-            let arr = Array(allowedBundleIds)
-            UserDefaults.standard.set(arr, forKey: "allowedBundleIds")
+            let arr = Array(blockedBundleIds)
+            UserDefaults.standard.set(arr, forKey: "blockedBundleIds")
         }
     }
 
@@ -36,7 +36,7 @@ final class SettingsStore: ObservableObject {
         selectedModelId = defaults.string(forKey: "selectedModelId")
         debounceInterval = defaults.object(forKey: "debounceInterval") as? Double ?? 0.4
         proofreadOnly = defaults.object(forKey: "proofreadOnly") as? Bool ?? false
-        let arr = defaults.array(forKey: "allowedBundleIds") as? [String] ?? []
-        allowedBundleIds = Set(arr)
+        let arr = defaults.array(forKey: "blockedBundleIds") as? [String] ?? []
+        blockedBundleIds = Set(arr)
     }
 }

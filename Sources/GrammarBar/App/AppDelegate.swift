@@ -141,10 +141,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !focusTracker.isSecureTextField(element) else { return }
         guard focusTracker.isEditableTextField(element) else { return }
 
-        // Enforce per-app allow-list
-        if !settings.allowedBundleIds.isEmpty {
-            guard let bundleId = focusTracker.frontmostAppBundleId(),
-                  settings.allowedBundleIds.contains(bundleId) else { return }
+        // Enforce per-app block-list
+        if !settings.blockedBundleIds.isEmpty,
+           let bundleId = focusTracker.frontmostAppBundleId(),
+           settings.blockedBundleIds.contains(bundleId) {
+            return
         }
 
         currentFocusedElement = element

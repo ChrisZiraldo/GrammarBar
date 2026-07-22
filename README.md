@@ -66,7 +66,7 @@ Models are stored in `~/Library/Application Support/GrammarBar/models/`.
 
 - **General → Enable/Disable**: toggle the correction globally, or use the menu-bar menu.
 - **General → Correction delay**: how long after you stop typing before a correction is requested (0.2–2.0 s).
-- **General → App allow-list**: paste one bundle ID per line to restrict GrammarBar to specific apps. Leave empty to enable everywhere.
+- **General → App block-list**: click **Add App…** to pick from a searchable list of apps installed on your Mac, or remove one with the ✕ next to it. GrammarBar is active everywhere except the apps you add here.
 - **Models**: download, switch, or delete models; shows the llama-server status.
 - **Permissions**: live permission status with quick-links to System Settings panes.
 
