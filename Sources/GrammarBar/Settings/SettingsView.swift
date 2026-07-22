@@ -229,6 +229,17 @@ private struct GeneralTab: View {
             }
 
             Section {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Resize bubble to fit long text", isOn: $store.resizeBubbleToFitText)
+                    Text("When enabled, the correction bubble grows taller to show long suggestions in full instead of scrolling within a fixed height.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            } header: {
+                Text("Appearance")
+            }
+
+            Section {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("GrammarBar is active everywhere except these apps.")
                         .font(.caption)
