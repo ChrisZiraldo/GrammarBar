@@ -12,6 +12,20 @@ final class BubbleGeometry: ObservableObject {
 
     // Horizontal position of the tail's apex, in the panel's own coordinate space.
     @Published var tailX: CGFloat = BubbleGeometry.panelWidth - 30
+
+    // Actual rendered height of the text area's content (including its own padding),
+    // reported by SwiftUI via a GeometryReader. Used to size the bubble precisely so
+    // long/bold/diff text is never clipped.
+    @Published var measuredTextHeight: CGFloat = 40
+}
+
+// MARK: - Preference key for measured text-content height
+
+private struct TextContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
 }
 
 // MARK: - Panel
@@ -91,6 +105,12 @@ final class OverlayPanel: NSPanel {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.relayout() }
             .store(in: &cancellables)
+
+        // Resize whenever SwiftUI reports a new rendered text height.
+        geometry.$measuredTextHeight
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.relayout() }
+            .store(in: &cancellables)
     }
 
     /// Positions the bubble directly below the menu bar status item.
@@ -145,17 +165,6 @@ final class OverlayPanel: NSPanel {
 
     // MARK: - Text measurement
 
-    static func measuredTextAreaHeight(for text: String) -> CGFloat {
-        let t = text.isEmpty ? " " : text
-        let width = BubbleGeometry.panelWidth - textHPadding * 2
-        let bounds = (t as NSString).boundingRect(
-            with: NSSize(width: width, height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: [.font: NSFont.systemFont(ofSize: textFontSize)]
-        )
-        return min(max(ceil(bounds.height) + textVPadding * 2, minTextAreaHeight), maxTextAreaHeight)
-    }
-
     static func measuredExplanationHeight(for text: String) -> CGFloat {
         let t = text.isEmpty ? " " : text
         let width = BubbleGeometry.panelWidth - textHPadding * 2
@@ -171,19 +180,15 @@ final class OverlayPanel: NSPanel {
         let isFinished = correctionEngine.state == .finished
             && !correctionEngine.correctionText.isEmpty
 
-        let displayText: String
-        if case .finished(let alts) = correctionEngine.rephraseState,
-           correctionEngine.rephraseIndex < alts.count {
-            displayText = alts[correctionEngine.rephraseIndex]
-        } else {
-            displayText = correctionEngine.correctionText
-        }
-
         guard SettingsStore.shared.resizeBubbleToFitText else {
             return BubbleGeometry.defaultHeight
         }
 
-        let textAreaHeight = Self.measuredTextAreaHeight(for: displayText)
+        // Use the actual rendered text height reported by SwiftUI, clamped to bounds.
+        let textAreaHeight = min(
+            max(geometry.measuredTextHeight, Self.minTextAreaHeight),
+            Self.maxTextAreaHeight
+        )
 
         var extra: CGFloat = 0
         if isFinished {
@@ -406,8 +411,19 @@ struct OverlayContentView: View {
                 }
                 .padding(.horizontal, OverlayPanel.textHPadding)
                 .padding(.vertical, OverlayPanel.textVPadding)
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: TextContentHeightKey.self,
+                            value: proxy.size.height
+                        )
+                    }
+                )
             }
             .frame(height: settings.resizeBubbleToFitText ? textAreaHeight : 100)
+            .onPreferenceChange(TextContentHeightKey.self) { height in
+                geometry.measuredTextHeight = height
+            }
 
             // Action footer row — visible only when finished
             if correctionEngine.state == .finished && !correctionEngine.correctionText.isEmpty {
@@ -620,14 +636,10 @@ struct OverlayContentView: View {
     // MARK: - Layout helpers
 
     private var textAreaHeight: CGFloat {
-        let displayText: String
-        if case .finished(let alts) = correctionEngine.rephraseState,
-           correctionEngine.rephraseIndex < alts.count {
-            displayText = alts[correctionEngine.rephraseIndex]
-        } else {
-            displayText = correctionEngine.correctionText
-        }
-        return OverlayPanel.measuredTextAreaHeight(for: displayText)
+        min(
+            max(geometry.measuredTextHeight, OverlayPanel.minTextAreaHeight),
+            OverlayPanel.maxTextAreaHeight
+        )
     }
 
     private func explanationHeight(for text: String) -> CGFloat {
