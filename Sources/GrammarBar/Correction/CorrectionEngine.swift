@@ -263,12 +263,23 @@ final class CorrectionEngine: ObservableObject {
                     self.correctionText += token
                 }
                 if !Task.isCancelled {
-                    // Trim stray trailing whitespace/newlines that models sometimes append.
-                    self.correctionText = self.correctionText
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    self.state = .finished
-                    if recordStats {
-                        SettingsStore.shared.recordSuggestion()
+                    // Run the output through the sanitizer to strip preambles/wrappers
+                    // and reject clearly broken responses (e.g. prompt injection leakage).
+                    if let clean = Self.sanitize(
+                        output: self.correctionText,
+                        original: text,
+                        mode: mode
+                    ) {
+                        self.correctionText = clean
+                        self.state = .finished
+                        if recordStats {
+                            SettingsStore.shared.recordSuggestion()
+                        }
+                    } else {
+                        // Output was empty or implausibly malformed — surface as an error
+                        // so the overlay shows a useful message instead of writing garbage.
+                        self.correctionText = ""
+                        self.state = .error("Unexpected model response — try again")
                     }
                 }
             } catch {
@@ -280,6 +291,86 @@ final class CorrectionEngine: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    /// Strips common leaked preambles and wrappers that small models sometimes
+    /// prepend or append despite being told not to.
+    ///
+    /// Examples of things stripped:
+    ///   "Here is the corrected text: ..."
+    ///   "Sure! Here's the corrected version:\n..."
+    ///   Surrounding backtick/quote pairs
+    ///
+    /// Returns nil when the result is clearly broken (empty after stripping, or
+    /// implausibly long relative to the input in non-expanding modes).
+    static func sanitize(
+        output: String,
+        original: String,
+        mode: CorrectionMode
+    ) -> String? {
+        var text = output.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Strip surrounding single/double quotes or backtick fences that the
+        // model sometimes wraps the entire answer in.
+        let quoteChars: [Character] = ["\"", "'", "`"]
+        if text.count >= 2,
+           let first = text.first, quoteChars.contains(first),
+           text.last == first {
+            text = String(text.dropFirst().dropLast())
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        // Strip triple-backtick code fences (``` … ```)
+        if text.hasPrefix("```") && text.hasSuffix("```") && text.count > 6 {
+            text = String(text.dropFirst(3).dropLast(3))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // Strip common preamble patterns.  We iterate so that e.g.
+        // "Sure! Here is the corrected text:\n…" collapses in one pass.
+        let preamblePatterns: [String] = [
+            "here is the corrected text:",
+            "here's the corrected text:",
+            "here is the corrected version:",
+            "here's the corrected version:",
+            "here is the corrected sentence:",
+            "here's the corrected sentence:",
+            "corrected text:",
+            "corrected version:",
+            "sure! ",
+            "sure, ",
+            "of course! ",
+            "of course, ",
+            "certainly! ",
+            "certainly, ",
+        ]
+        var changed = true
+        while changed {
+            changed = false
+            for pattern in preamblePatterns {
+                if text.lowercased().hasPrefix(pattern) {
+                    text = String(text.dropFirst(pattern.count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    changed = true
+                }
+            }
+        }
+
+        // Reject empty results.
+        guard !text.isEmpty else { return nil }
+
+        // For non-expanding modes (standard, proofread), reject output that is
+        // wildly longer than the input — a strong signal the model went off-rails.
+        // Expanding modes (formal, friendly, confident, concise, casual) can
+        // legitimately grow or shrink, so we skip this check for them.
+        let nonExpandingModes: Set<CorrectionMode> = [.standard, .proofread]
+        if nonExpandingModes.contains(mode) {
+            let ratio = Double(text.count) / Double(max(original.count, 1))
+            if ratio > 3.0 {
+                return nil
+            }
+        }
+
+        return text
+    }
 
     /// Parses numbered alternatives ("1. ...\n2. ...\n3. ...") from raw model output.
     private static func parseAlternatives(from raw: String) -> [String] {
