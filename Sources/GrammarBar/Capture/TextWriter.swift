@@ -3,6 +3,13 @@ import ApplicationServices
 
 final class TextWriter {
 
+    /// Copy text to the system clipboard without modifying the focused element.
+    func copyToClipboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
     /// Write corrected text into the focused element by simulating select-all + paste.
     ///
     /// We deliberately don't use AXUIElementSetAttributeValue(kAXValueAttribute) here. Custom

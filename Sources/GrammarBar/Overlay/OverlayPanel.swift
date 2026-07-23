@@ -7,7 +7,7 @@ import SwiftUI
 final class BubbleGeometry: ObservableObject {
     static let tailWidth: CGFloat = 18
     static let tailHeight: CGFloat = 9
-    static let panelWidth: CGFloat = 360
+    static let panelWidth: CGFloat = 380
     static let defaultHeight: CGFloat = 160 + BubbleGeometry.tailHeight
 
     // Horizontal position of the tail's apex, in the panel's own coordinate space.
@@ -19,6 +19,7 @@ final class BubbleGeometry: ObservableObject {
 final class OverlayPanel: NSPanel {
     private let correctionEngine: CorrectionEngine
     private let onAccept: () -> Void
+    private let onCopy: () -> Void
     private let onDismiss: () -> Void
     private let geometry = BubbleGeometry()
     private let hostingView: NSHostingView<OverlayContentView>
@@ -30,15 +31,22 @@ final class OverlayPanel: NSPanel {
     private var anchorFrame: CGRect?
     private var originX: CGFloat = 0
 
-    init(correctionEngine: CorrectionEngine, onAccept: @escaping () -> Void, onDismiss: @escaping () -> Void) {
+    init(
+        correctionEngine: CorrectionEngine,
+        onAccept: @escaping () -> Void,
+        onCopy: @escaping () -> Void,
+        onDismiss: @escaping () -> Void
+    ) {
         self.correctionEngine = correctionEngine
         self.onAccept = onAccept
+        self.onCopy = onCopy
         self.onDismiss = onDismiss
 
         let content = OverlayContentView(
             correctionEngine: correctionEngine,
             geometry: geometry,
             onAccept: onAccept,
+            onCopy: onCopy,
             onDismiss: onDismiss
         )
         let hostingView = NSHostingView(rootView: content)
@@ -58,37 +66,34 @@ final class OverlayPanel: NSPanel {
         hasShadow = true
         isMovable = false
 
-        // NSHostingView defaults to deriving Auto Layout min/max/intrinsic-size
-        // constraints from its SwiftUI content and applying them to the window's
-        // contentMinSize/contentMaxSize — which fights and overrides our manual
-        // setFrame() calls in relayout(). Disable that so we're fully in control.
-        // (We also can't reliably read the content's size back out through SwiftUI —
-        // neither PreferenceKey propagation nor intrinsicContentSize/fittingSize behave
-        // predictably for this dynamically-streaming, AppKit-hosted content — so
-        // desiredHeight below measures the text directly with AppKit's own APIs instead.)
+        // Disable SwiftUI's automatic min/max sizing — we drive the frame manually.
         hostingView.sizingOptions = []
         contentView = hostingView
 
         // Re-measure and resize whenever the content that affects height changes.
-        // (SwiftUI PreferenceKey-based size reporting doesn't reliably propagate
-        // out of this AppKit-hosted view, so we pull the size directly instead.)
         correctionEngine.$correctionText
             .combineLatest(correctionEngine.$state)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.relayout() }
             .store(in: &cancellables)
 
-        // Also relayout when the user toggles resize mode so an open bubble
-        // immediately snaps to the correct size without waiting for the next token.
+        correctionEngine.$rephraseState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.relayout() }
+            .store(in: &cancellables)
+
+        correctionEngine.$explanationState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.relayout() }
+            .store(in: &cancellables)
+
         SettingsStore.shared.$resizeBubbleToFitText
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.relayout() }
             .store(in: &cancellables)
     }
 
-    /// Positions the bubble directly below the menu bar status item, with its
-    /// tail pointing up at the icon. `statusItemFrame` is in AppKit screen
-    /// coordinates (origin bottom-left), as returned by the status item's button window.
+    /// Positions the bubble directly below the menu bar status item.
     func position(belowStatusItem statusItemFrame: CGRect) {
         let panelWidth = BubbleGeometry.panelWidth
         let tailInsetFromRight: CGFloat = 30
@@ -109,7 +114,6 @@ final class OverlayPanel: NSPanel {
                 tailX -= minX - computedOriginX
                 computedOriginX = minX
             }
-            // Keep the tail apex from sliding past the bubble's rounded corners.
             tailX = min(max(tailX, 24), panelWidth - 24)
         }
 
@@ -119,11 +123,6 @@ final class OverlayPanel: NSPanel {
         relayout()
     }
 
-    /// Recomputes the panel's frame from the last known anchor, keeping the top
-    /// edge (the tail apex, next to the status icon) fixed while the height
-    /// tracks either the static default or the live content height.
-    /// Early-returns when the frame hasn't changed to avoid redundant
-    /// `setFrame(display:)` calls on every streamed token.
     private func relayout() {
         guard let anchorFrame else { return }
         let height = desiredHeight
@@ -134,30 +133,18 @@ final class OverlayPanel: NSPanel {
     }
 
     // MARK: - Layout constants
-    // These are shared between the AppKit panel (measurement) and the SwiftUI view
-    // (padding/font), so the two can never silently diverge.
 
-    /// Horizontal padding on each side of the correction text.
     static let textHPadding: CGFloat = 12
-    /// Vertical padding on each side of the correction text.
     static let textVPadding: CGFloat = 8
-    /// Font size used for the correction text.
     static let textFontSize: CGFloat = 13
-    /// Minimum height of the text area.
     static let minTextAreaHeight: CGFloat = 40
-    /// Ceiling on how tall the text area is allowed to grow before it scrolls.
-    static let maxTextAreaHeight: CGFloat = 320
+    static let maxTextAreaHeight: CGFloat = 300
 
-    /// The fixed, non-text-driven "chrome" height (header + divider + tail + outer
-    /// padding) that surrounds the text area — everything `defaultHeight` budgets for
-    /// besides the default fixed text area.
+    /// Fixed chrome: tail + header + divider + outer padding.
     private static let chromeHeight: CGFloat = BubbleGeometry.defaultHeight - 100
 
     // MARK: - Text measurement
 
-    /// Measures how tall the text area should be for the given string using the same
-    /// font, padding, and clamp used by the SwiftUI view. Single source of truth —
-    /// both `desiredHeight` and `OverlayContentView.textAreaHeight` call this.
     static func measuredTextAreaHeight(for text: String) -> CGFloat {
         let t = text.isEmpty ? " " : text
         let width = BubbleGeometry.panelWidth - textHPadding * 2
@@ -169,23 +156,55 @@ final class OverlayPanel: NSPanel {
         return min(max(ceil(bounds.height) + textVPadding * 2, minTextAreaHeight), maxTextAreaHeight)
     }
 
+    static func measuredExplanationHeight(for text: String) -> CGFloat {
+        let t = text.isEmpty ? " " : text
+        let width = BubbleGeometry.panelWidth - textHPadding * 2
+        let bounds = (t as NSString).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: NSFont.systemFont(ofSize: 11)]
+        )
+        return min(max(ceil(bounds.height) + textVPadding * 2, 30), 140)
+    }
+
     private var desiredHeight: CGFloat {
+        let isFinished = correctionEngine.state == .finished
+            && !correctionEngine.correctionText.isEmpty
+
+        let displayText: String
+        if case .finished(let alts) = correctionEngine.rephraseState,
+           correctionEngine.rephraseIndex < alts.count {
+            displayText = alts[correctionEngine.rephraseIndex]
+        } else {
+            displayText = correctionEngine.correctionText
+        }
+
         guard SettingsStore.shared.resizeBubbleToFitText else {
             return BubbleGeometry.defaultHeight
         }
 
-        let textAreaHeight = Self.measuredTextAreaHeight(for: correctionEngine.correctionText)
+        let textAreaHeight = Self.measuredTextAreaHeight(for: displayText)
 
         var extra: CGFloat = 0
-        if correctionEngine.state == .finished, !correctionEngine.correctionText.isEmpty {
-            extra += 38 // divider + accept row + its padding
+        if isFinished {
+            extra += 20  // readability row
+            extra += 38  // action row (copy / rephrase / why / accept)
         }
         if case .error = correctionEngine.state {
-            extra += 26 // divider + error text + its padding
+            extra += 26
         }
 
-        // No defaultHeight floor here — when resize is on the window matches the
-        // measured content so short corrections render flush without a gap.
+        // Explanation area
+        switch correctionEngine.explanationState {
+        case .loading:
+            extra += 44  // divider + spinner row
+        case .finished(let text):
+            extra += 1   // divider
+            extra += Self.measuredExplanationHeight(for: text)
+        default:
+            break
+        }
+
         return Self.chromeHeight + textAreaHeight + extra
     }
 
@@ -195,6 +214,65 @@ final class OverlayPanel: NSPanel {
 
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+}
+
+// MARK: - Word diff
+
+struct DiffToken: Identifiable {
+    enum Kind { case same, removed, added }
+    let id = UUID()
+    let text: String
+    let kind: Kind
+}
+
+enum WordDiff {
+    /// Compute a word-level diff between two strings using LCS.
+    static func compute(original: String, corrected: String) -> [DiffToken] {
+        let origWords = words(original)
+        let corrWords = words(corrected)
+
+        guard origWords != corrWords else {
+            return [DiffToken(text: corrected, kind: .same)]
+        }
+
+        let m = origWords.count
+        let n = corrWords.count
+
+        // Build LCS DP table
+        var dp = [[Int]](repeating: [Int](repeating: 0, count: n + 1), count: m + 1)
+        for i in 1...m {
+            for j in 1...n {
+                if origWords[i - 1].lowercased() == corrWords[j - 1].lowercased() {
+                    dp[i][j] = dp[i - 1][j - 1] + 1
+                } else {
+                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+                }
+            }
+        }
+
+        // Trace back through DP to build token list
+        var tokens: [DiffToken] = []
+        var i = m, j = n
+        while i > 0 || j > 0 {
+            if i > 0 && j > 0 && origWords[i - 1].lowercased() == corrWords[j - 1].lowercased() {
+                tokens.append(DiffToken(text: corrWords[j - 1], kind: .same))
+                i -= 1; j -= 1
+            } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+                tokens.append(DiffToken(text: corrWords[j - 1], kind: .added))
+                j -= 1
+            } else {
+                tokens.append(DiffToken(text: origWords[i - 1], kind: .removed))
+                i -= 1
+            }
+        }
+
+        return tokens.reversed()
+    }
+
+    private static func words(_ text: String) -> [String] {
+        // Split on whitespace but keep punctuation attached to words
+        text.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+    }
 }
 
 // MARK: - Speech bubble shape
@@ -235,11 +313,12 @@ private struct SpeechBubbleShape: Shape {
 
 // MARK: - SwiftUI content
 
-private struct OverlayContentView: View {
+struct OverlayContentView: View {
     @ObservedObject var correctionEngine: CorrectionEngine
     @ObservedObject var geometry: BubbleGeometry
     @ObservedObject private var settings = SettingsStore.shared
     let onAccept: () -> Void
+    let onCopy: () -> Void
     let onDismiss: () -> Void
 
     var body: some View {
@@ -253,7 +332,7 @@ private struct OverlayContentView: View {
                 SpeechBubbleShape(tailX: geometry.tailX)
                     .stroke(.separator, lineWidth: 0.5)
             }
-            .padding(4) // room for the shadow to breathe
+            .padding(4)
     }
 
     private var bubbleBody: some View {
@@ -268,8 +347,23 @@ private struct OverlayContentView: View {
                 Text(headerLabel)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.secondary)
+                    .lineLimit(1)
 
-                Spacer()
+                Spacer(minLength: 4)
+
+                // Readability summary (when finished)
+                if correctionEngine.state == .finished,
+                   !correctionEngine.originalText.isEmpty {
+                    let r = Readability.analyse(correctionEngine.originalText)
+                    Text("\(r.wordCount) words · \(r.grade.rawValue)")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .layoutPriority(-1)
+                }
+
+                // On-the-fly style picker — changes this correction only, not global settings.
+                styleMenu
 
                 Button {
                     onDismiss()
@@ -286,43 +380,45 @@ private struct OverlayContentView: View {
 
             Divider()
 
-            // Correction text. When the resize setting is off, this is a fixed 100pt
-            // scrollable area, same as always. When it's on, OverlayPanel measures the
-            // text itself with NSString.boundingRect (SwiftUI's own size-reporting
-            // mechanisms — PreferenceKey, intrinsicContentSize, fittingSize — all proved
-            // unreliable for this dynamically-streaming, AppKit-hosted content) and
-            // resizes the window to fit, so the text area just needs a height that
-            // matches that same computation, clamped the same way, so the ScrollView's
-            // viewport and the window's actual size agree.
+            // Text area — diff when finished, plain while streaming
             ScrollView {
-                Text(correctionEngine.correctionText.isEmpty ? " " : correctionEngine.correctionText)
-                    .font(.system(size: OverlayPanel.textFontSize))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, OverlayPanel.textHPadding)
-                    .padding(.vertical, OverlayPanel.textVPadding)
+                Group {
+                    if case .finished(let alts) = correctionEngine.rephraseState,
+                       correctionEngine.rephraseIndex < alts.count {
+                        // Show current rephrase alternative as plain text
+                        Text(alts[correctionEngine.rephraseIndex])
+                            .font(.system(size: OverlayPanel.textFontSize))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    } else if correctionEngine.state == .finished,
+                              !correctionEngine.originalText.isEmpty {
+                        // Show word-level diff
+                        diffTextView
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    } else {
+                        // Streaming: plain text
+                        Text(correctionEngine.correctionText.isEmpty ? " " : correctionEngine.correctionText)
+                            .font(.system(size: OverlayPanel.textFontSize))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                }
+                .padding(.horizontal, OverlayPanel.textHPadding)
+                .padding(.vertical, OverlayPanel.textVPadding)
             }
             .frame(height: settings.resizeBubbleToFitText ? textAreaHeight : 100)
 
-            // Accept button — visible only when stream is complete
+            // Action footer row — visible only when finished
             if correctionEngine.state == .finished && !correctionEngine.correctionText.isEmpty {
                 Divider()
-                HStack {
-                    Text("⌃Return to accept")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Button("Accept") {
-                        onAccept()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .tint(.accentColor)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                actionRow
             }
 
+            // Explanation area
+            explanationView
+
+            // Error row
             if case .error(let msg) = correctionEngine.state {
                 Divider()
                 Text(msg)
@@ -335,18 +431,218 @@ private struct OverlayContentView: View {
         .padding(.top, BubbleGeometry.tailHeight)
     }
 
-    /// Height for the ScrollView when resize-to-fit is enabled. Delegates to
-    /// OverlayPanel's single measurement helper so the viewport always agrees with
-    /// the window height.
+    // MARK: - Style menu
+
+    private var styleMenu: some View {
+        Menu {
+            ForEach(CorrectionMode.allCases) { mode in
+                Button {
+                    correctionEngine.applyMode(mode)
+                } label: {
+                    if mode == correctionEngine.activeMode {
+                        Label(mode.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(mode.displayName)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 2) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 9))
+                Text(correctionEngine.activeMode.displayName)
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .foregroundColor(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Change the correction style for this text only")
+    }
+
+    // MARK: - Diff text view
+
+    @ViewBuilder
+    private var diffTextView: some View {
+        let tokens = WordDiff.compute(
+            original: correctionEngine.originalText,
+            corrected: correctionEngine.correctionText
+        )
+        diffText(tokens: tokens)
+            .font(.system(size: OverlayPanel.textFontSize))
+    }
+
+    private func diffText(tokens: [DiffToken]) -> Text {
+        tokens.reduce(Text("")) { result, token in
+            let word = token.text
+            let space = Text(" ")
+            switch token.kind {
+            case .same:
+                return result + Text(word) + space
+            case .added:
+                return result + Text(word).foregroundColor(.green).bold() + space
+            case .removed:
+                return result + Text(word).foregroundColor(.red).strikethrough() + space
+            }
+        }
+    }
+
+    // MARK: - Action row
+
+    private var actionRow: some View {
+        HStack(spacing: 6) {
+            Text("⌃Return to accept")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+
+            Spacer()
+
+            // Copy
+            Button {
+                onCopy()
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.secondary)
+            .help("Copy to clipboard")
+
+            // Rephrase
+            rephraseButton
+
+            // Why? (explanation)
+            Button {
+                correctionEngine.requestExplanation()
+            } label: {
+                switch correctionEngine.explanationState {
+                case .loading:
+                    ProgressView().scaleEffect(0.5).frame(width: 16, height: 16)
+                default:
+                    Image(systemName: "questionmark.circle")
+                        .font(.system(size: 11))
+                        .foregroundColor(
+                            correctionEngine.explanationState == .idle ? .secondary : .accentColor
+                        )
+                }
+            }
+            .buttonStyle(.plain)
+            .help("Explain changes")
+
+            // Accept
+            Button("Accept") {
+                onAccept()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .tint(.accentColor)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var rephraseButton: some View {
+        switch correctionEngine.rephraseState {
+        case .loading:
+            ProgressView().scaleEffect(0.5).frame(width: 16, height: 16)
+
+        case .finished(let alts):
+            Button {
+                correctionEngine.nextRephrase()
+            } label: {
+                HStack(spacing: 2) {
+                    Image(systemName: "arrow.2.circlepath")
+                        .font(.system(size: 10))
+                    Text("\(correctionEngine.rephraseIndex + 1)/\(alts.count)")
+                        .font(.system(size: 10))
+                }
+                .foregroundColor(.accentColor)
+            }
+            .buttonStyle(.plain)
+            .help("Cycle alternatives")
+
+        default:
+            Button {
+                correctionEngine.requestRephrase()
+            } label: {
+                Image(systemName: "arrow.2.circlepath")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Show alternatives")
+        }
+    }
+
+    // MARK: - Explanation view
+
+    @ViewBuilder
+    private var explanationView: some View {
+        switch correctionEngine.explanationState {
+        case .idle:
+            EmptyView()
+
+        case .loading:
+            Divider()
+            HStack {
+                ProgressView().scaleEffect(0.6)
+                Text("Explaining changes…")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+
+        case .finished(let text):
+            Divider()
+            ScrollView {
+                Text(text)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+            }
+            .frame(height: explanationHeight(for: text))
+
+        case .error(let msg):
+            Divider()
+            Text("Could not explain: \(msg)")
+                .font(.system(size: 11))
+                .foregroundColor(.red)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+        }
+    }
+
+    // MARK: - Layout helpers
+
     private var textAreaHeight: CGFloat {
-        OverlayPanel.measuredTextAreaHeight(for: correctionEngine.correctionText)
+        let displayText: String
+        if case .finished(let alts) = correctionEngine.rephraseState,
+           correctionEngine.rephraseIndex < alts.count {
+            displayText = alts[correctionEngine.rephraseIndex]
+        } else {
+            displayText = correctionEngine.correctionText
+        }
+        return OverlayPanel.measuredTextAreaHeight(for: displayText)
+    }
+
+    private func explanationHeight(for text: String) -> CGFloat {
+        OverlayPanel.measuredExplanationHeight(for: text)
     }
 
     private var headerLabel: String {
         switch correctionEngine.state {
         case .idle:        return "GrammarBar"
         case .correcting:  return "Correcting…"
-        case .finished:    return "Suggested correction"
+        case .finished:
+            if case .finished = correctionEngine.rephraseState {
+                return "Alternative \(correctionEngine.rephraseIndex + 1)"
+            }
+            return "Suggested correction"
         case .error:       return "Error"
         }
     }

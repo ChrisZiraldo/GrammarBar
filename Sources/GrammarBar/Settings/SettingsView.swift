@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import ApplicationServices
+import ServiceManagement
 
 struct SettingsView: View {
     @ObservedObject private var store = SettingsStore.shared
@@ -31,7 +32,7 @@ struct SettingsView: View {
             .tabItem { Label("Permissions", systemImage: "lock.shield") }
             .tag(2)
         }
-        .frame(width: 520, height: 420)
+        .frame(width: 540, height: 480)
         .onAppear {
             checkPermissions()
             modelManager.refreshInstalledStates()
@@ -192,13 +193,17 @@ private struct ModelRow: View {
 private struct GeneralTab: View {
     @ObservedObject var store: SettingsStore
     @State private var showingAppPicker = false
+    @State private var showingTonePicker = false
+    @State private var newDictionaryWord = ""
 
     var body: some View {
         Form {
+            // ── Enable ──────────────────────────────────────────────
             Section {
                 Toggle("Enable GrammarBar", isOn: $store.isEnabled)
             }
 
+            // ── Timing ──────────────────────────────────────────────
             Section {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
@@ -217,10 +222,17 @@ private struct GeneralTab: View {
                 Text("Timing")
             }
 
+            // ── Correction Style ─────────────────────────────────────
             Section {
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Proofread only (no rewording)", isOn: $store.proofreadOnly)
-                    Text("When enabled, only spelling, grammar, and punctuation are fixed. The text is never reworded or restyled.")
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("Style", selection: $store.correctionMode) {
+                        ForEach(CorrectionMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    Text(correctionModeDescription)
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -228,6 +240,90 @@ private struct GeneralTab: View {
                 Text("Correction Style")
             }
 
+            // ── Custom Dictionary ────────────────────────────────────
+            Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Words and terms the model will never alter.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    if store.customDictionary.isEmpty {
+                        Text("No custom words added.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .padding(.vertical, 2)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(store.customDictionary, id: \.self) { word in
+                                HStack {
+                                    Text(word).font(.system(size: 12))
+                                    Spacer()
+                                    Button {
+                                        store.customDictionary.removeAll { $0 == word }
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(.vertical, 3)
+                                if word != store.customDictionary.last {
+                                    Divider()
+                                }
+                            }
+                        }
+                    }
+
+                    HStack(spacing: 6) {
+                        TextField("Add word or term…", text: $newDictionaryWord)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { addDictionaryWord() }
+                        Button("Add") { addDictionaryWord() }
+                            .controlSize(.small)
+                            .disabled(newDictionaryWord.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                }
+            } header: {
+                Text("Custom Dictionary")
+            }
+
+            // ── Per-App Tone ─────────────────────────────────────────
+            Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Override the correction style for specific apps.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    let overrides = store.appToneOverrides.keys.sorted()
+                    if overrides.isEmpty {
+                        Text("No per-app overrides set.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .padding(.vertical, 4)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(overrides, id: \.self) { bundleId in
+                                AppToneRow(bundleId: bundleId, mode: Binding(
+                                    get: { store.appToneOverrides[bundleId] ?? .standard },
+                                    set: { store.appToneOverrides[bundleId] = $0 }
+                                )) {
+                                    store.appToneOverrides.removeValue(forKey: bundleId)
+                                }
+                                if bundleId != overrides.last {
+                                    Divider()
+                                }
+                            }
+                        }
+                    }
+
+                    Button("Add App…") { showingTonePicker = true }
+                        .controlSize(.small)
+                }
+            } header: {
+                Text("Per-App Style")
+            }
+
+            // ── Appearance ──────────────────────────────────────────
             Section {
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle("Resize bubble to fit long text", isOn: $store.resizeBubbleToFitText)
@@ -239,6 +335,7 @@ private struct GeneralTab: View {
                 Text("Appearance")
             }
 
+            // ── App Block-list ───────────────────────────────────────
             Section {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("GrammarBar is active everywhere except these apps.")
@@ -264,13 +361,44 @@ private struct GeneralTab: View {
                         }
                     }
 
-                    Button("Add App…") {
-                        showingAppPicker = true
-                    }
-                    .controlSize(.small)
+                    Button("Add App…") { showingAppPicker = true }
+                        .controlSize(.small)
                 }
             } header: {
                 Text("App block-list")
+            }
+
+            // ── System ──────────────────────────────────────────────
+            Section {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Launch at login", isOn: Binding(
+                        get: { store.launchAtLogin },
+                        set: { LoginItem.setEnabled($0) }
+                    ))
+                    Text("Start GrammarBar automatically when you log in.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Total corrections accepted")
+                        Spacer()
+                        Text("\(store.totalAccepted)")
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                    }
+                    HStack {
+                        Text("This week")
+                        Spacer()
+                        Text("\(store.weekAccepted)")
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+                .font(.system(size: 12))
+            } header: {
+                Text("System")
             }
         }
         .formStyle(.grouped)
@@ -278,8 +406,186 @@ private struct GeneralTab: View {
         .sheet(isPresented: $showingAppPicker) {
             AppPickerSheet(blockedIds: $store.blockedBundleIds)
         }
+        .sheet(isPresented: $showingTonePicker) {
+            AppToneSheet(overrides: $store.appToneOverrides)
+        }
+    }
+
+    private var correctionModeDescription: String {
+        switch store.correctionMode {
+        case .standard:  return "Fixes grammar, spelling, and punctuation while preserving your voice."
+        case .proofread: return "Only fixes clear errors — never rewords or restyres anything correct."
+        case .formal:    return "Rewrites in a professional, business-appropriate tone."
+        case .casual:    return "Keeps the text natural and conversational."
+        case .concise:   return "Removes filler and redundancy to make the text shorter."
+        case .confident: return "Turns passive voice and hedging into assertive, direct language."
+        case .friendly:  return "Warms up the tone to feel approachable and personable."
+        }
+    }
+
+    private func addDictionaryWord() {
+        let word = newDictionaryWord.trimmingCharacters(in: .whitespaces)
+        guard !word.isEmpty, !store.customDictionary.contains(word) else { return }
+        store.customDictionary.append(word)
+        newDictionaryWord = ""
     }
 }
+
+// MARK: - Per-app tone row
+
+private struct AppToneRow: View {
+    let bundleId: String
+    @Binding var mode: CorrectionMode
+    let onRemove: () -> Void
+
+    var body: some View {
+        let app = InstalledAppsScanner.resolve(bundleId: bundleId)
+
+        HStack(spacing: 8) {
+            if let app {
+                Image(nsImage: app.icon)
+                    .resizable()
+                    .frame(width: 18, height: 18)
+            } else {
+                Image(systemName: "app.dashed")
+                    .frame(width: 18, height: 18)
+                    .foregroundColor(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 0) {
+                Text(app?.name ?? bundleId)
+                    .font(.system(size: 12))
+                if app != nil {
+                    Text(bundleId)
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            Spacer()
+
+            Picker("", selection: $mode) {
+                ForEach(CorrectionMode.allCases) { m in
+                    Text(m.displayName).tag(m)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 130)
+
+            Button {
+                onRemove()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 3)
+    }
+}
+
+// MARK: - App tone sheet
+
+private struct AppToneSheet: View {
+    @Binding var overrides: [String: CorrectionMode]
+    @Environment(\.dismiss) private var dismiss
+    @State private var apps: [InstalledApp] = []
+    @State private var isLoading = true
+    @State private var query = ""
+
+    private var filteredApps: [InstalledApp] {
+        guard !query.isEmpty else { return apps }
+        return apps.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Per-App Style Override")
+                    .font(.headline)
+                Spacer()
+                Button("Done") { dismiss() }
+            }
+            .padding([.horizontal, .top], 16)
+            .padding(.bottom, 8)
+
+            TextField("Search apps…", text: $query)
+                .textFieldStyle(.roundedBorder)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 10)
+
+            Divider()
+
+            if isLoading {
+                Spacer()
+                ProgressView("Scanning Applications folder…")
+                Spacer()
+            } else if filteredApps.isEmpty {
+                Spacer()
+                Text("No apps found.")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                Spacer()
+            } else {
+                List(filteredApps) { app in
+                    HStack(spacing: 10) {
+                        Image(nsImage: app.icon)
+                            .resizable()
+                            .frame(width: 22, height: 22)
+                        Text(app.name)
+                            .font(.system(size: 12))
+                        Spacer()
+
+                        if overrides[app.bundleId] != nil {
+                            Picker("", selection: Binding(
+                                get: { overrides[app.bundleId] ?? .standard },
+                                set: { overrides[app.bundleId] = $0 }
+                            )) {
+                                ForEach(CorrectionMode.allCases) { mode in
+                                    Text(mode.displayName).tag(mode)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .frame(width: 130)
+
+                            Button {
+                                overrides.removeValue(forKey: app.bundleId)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            Button("Add") {
+                                overrides[app.bundleId] = .standard
+                            }
+                            .controlSize(.small)
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+        .frame(width: 420, height: 460)
+        .onAppear(perform: loadApps)
+    }
+
+    private func loadApps() {
+        guard apps.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let scanned = InstalledAppsScanner.scanAll()
+            DispatchQueue.main.async {
+                apps = scanned
+                isLoading = false
+            }
+        }
+    }
+}
+
+// MARK: - Blocked app row
 
 private struct BlockedAppRow: View {
     let bundleId: String
@@ -323,7 +629,7 @@ private struct BlockedAppRow: View {
     }
 }
 
-// MARK: - App picker sheet
+// MARK: - App picker sheet (block-list)
 
 private struct AppPickerSheet: View {
     @Binding var blockedIds: Set<String>

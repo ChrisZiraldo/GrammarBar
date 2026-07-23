@@ -1,39 +1,67 @@
 import Foundation
 
 struct LlamaClient {
-    private static let systemPrompt = """
-        You are a precise grammar and spelling corrector. \
-        Fix all grammar, spelling, and punctuation errors. \
-        Improve clarity only when the meaning is genuinely ambiguous. \
-        Preserve the author's voice, style, and intent. \
-        Return ONLY the corrected text — no commentary, no quotes, no explanation, no preamble.
-        """
-
-    private static let proofreadOnlySystemPrompt = """
-        You are a precise proofreader. \
-        Fix ONLY spelling mistakes, grammar errors, and punctuation errors. \
-        Do NOT reword, rephrase, restructure, or otherwise change any part of the text that is already correct. \
-        Do NOT improve style, clarity, tone, or word choice. \
-        Make the smallest possible edit that fixes the error — leave everything else exactly as written. \
-        Preserve the author's voice, style, and intent. \
-        Return ONLY the corrected text — no commentary, no quotes, no explanation, no preamble.
-        """
-
     let port: Int
-    let proofreadOnly: Bool
+    let mode: CorrectionMode
+    let dictionary: [String]
 
-    init(port: Int, proofreadOnly: Bool = false) {
+    init(port: Int, mode: CorrectionMode = .standard, dictionary: [String] = []) {
         self.port = port
-        self.proofreadOnly = proofreadOnly
+        self.mode = mode
+        self.dictionary = dictionary
     }
 
-    // Streams corrected tokens for the given input text.
+    // MARK: - Correction (streaming)
+
+    /// Streams corrected tokens for the given input text using the configured mode.
     func correct(_ text: String) -> AsyncThrowingStream<String, Error> {
+        let systemPrompt = mode.fullSystemPrompt(dictionary: dictionary)
+        return stream(systemPrompt: systemPrompt, userContent: text, temperature: 0.1)
+    }
+
+    // MARK: - Rephrase (streaming)
+
+    /// Streams 3 numbered alternative rewrites for the given text.
+    /// The caller is responsible for splitting the response on numbered lines.
+    func rephrase(_ text: String) -> AsyncThrowingStream<String, Error> {
+        let systemPrompt = """
+            You are a creative writing assistant. \
+            Provide exactly 3 alternative rewrites of the user's text. \
+            Format the response as:
+            1. <first alternative>
+            2. <second alternative>
+            3. <third alternative>
+            Each alternative should preserve the original meaning but vary the phrasing, \
+            structure, or style. Output ONLY the numbered list — no commentary, no preamble.
+            """
+        return stream(systemPrompt: systemPrompt, userContent: text, temperature: 0.7)
+    }
+
+    // MARK: - Explanation (streaming)
+
+    /// Streams a bullet-point list of changes made from `original` to `corrected`.
+    func explain(original: String, corrected: String) -> AsyncThrowingStream<String, Error> {
+        let systemPrompt = """
+            You are a grammar teacher. \
+            The user will give you two versions of a sentence: the original and the corrected version. \
+            List every change that was made, as a short bullet-point for each. \
+            Format: "- Changed X → Y (reason)" \
+            Output ONLY the bullet list — no preamble, no summary.
+            """
+        let userContent = "Original:\n\(original)\n\nCorrected:\n\(corrected)"
+        return stream(systemPrompt: systemPrompt, userContent: userContent, temperature: 0.1)
+    }
+
+    // MARK: - Private
+
+    private func stream(
+        systemPrompt: String,
+        userContent: String,
+        temperature: Double
+    ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
-            // Wrap the SSE loop in a structured Task so that cancelling the
-            // stream (via continuation.onTermination) also stops the underlying
-            // URLSession byte stream — preventing stale generations from piling
-            // up on the single-threaded llama-server when the user keeps typing.
+            // Wrap in a structured Task so cancelling the consumer also tears
+            // down the URLSession byte stream immediately.
             let streamTask = Task {
                 do {
                     guard let url = URL(string: "http://127.0.0.1:\(self.port)/v1/chat/completions") else {
@@ -47,11 +75,11 @@ struct LlamaClient {
                     let body: [String: Any] = [
                         "model": "local-model",
                         "messages": [
-                            ["role": "system", "content": self.proofreadOnly ? Self.proofreadOnlySystemPrompt : Self.systemPrompt],
-                            ["role": "user", "content": text]
+                            ["role": "system", "content": systemPrompt],
+                            ["role": "user", "content": userContent]
                         ],
                         "stream": true,
-                        "temperature": 0.1,
+                        "temperature": temperature,
                         "max_tokens": 2048
                     ]
                     request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -85,9 +113,6 @@ struct LlamaClient {
                 }
             }
 
-            // When the consumer stops iterating (task cancelled, stream dropped,
-            // or normal completion), cancel the producer Task so the URLSession
-            // byte stream is torn down immediately rather than running to completion.
             continuation.onTermination = { _ in streamTask.cancel() }
         }
     }

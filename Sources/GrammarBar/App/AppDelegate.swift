@@ -28,6 +28,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentFocusedElement: AXUIElement?
     private var cancellables = Set<AnyCancellable>()
 
+    // MARK: - Undo state
+
+    /// The text in the focused field just before the last accepted correction.
+    private var undoText: String?
+    /// The element that was focused when the last correction was accepted.
+    private var undoElement: AXUIElement?
+
     // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -69,6 +76,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
            let entry = ModelCatalog.model(for: modelId),
            let path = modelManager.installedPath(for: entry) {
             Task { await serverManager.start(modelPath: path.path) }
+        }
+
+        // Sync launch-at-login after the app is fully set up (SMAppService
+        // IPC can transiently affect TCC state if called during startup).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            LoginItem.syncOnLaunch()
         }
     }
 
@@ -142,8 +155,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard focusTracker.isEditableTextField(element) else { return }
 
         // Enforce per-app block-list
+        let bundleId = focusTracker.frontmostAppBundleId()
         if !settings.blockedBundleIds.isEmpty,
-           let bundleId = focusTracker.frontmostAppBundleId(),
+           let bundleId,
            settings.blockedBundleIds.contains(bundleId) {
             return
         }
@@ -153,7 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let text = focusTracker.value(of: element) ?? ""
         guard text.count >= 3 else { return }  // Skip trivially short strings
 
-        correctionEngine.schedule(text: text)
+        correctionEngine.schedule(text: text, bundleId: bundleId)
     }
 
     // MARK: - Return key handling
@@ -205,6 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             overlayPanel = OverlayPanel(
                 correctionEngine: correctionEngine,
                 onAccept: { [weak self] in self?.acceptCorrection() },
+                onCopy: { [weak self] in self?.copyCorrection() },
                 onDismiss: { [weak self] in self?.dismissOverlay() }
             )
         }
@@ -218,36 +233,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Accept / Dismiss
+    // MARK: - Accept / Copy / Dismiss / Undo
 
     private func acceptCorrection() {
         guard let element = currentFocusedElement else { return }
-        let corrected = correctionEngine.correctionText
-        guard !corrected.isEmpty else { return }
 
-        // Re-resolve the live focused element and verify it is still the same
-        // field we captured the correction for. Focus can silently drift if the
-        // user clicked elsewhere without typing (no keyDown → no dismissOverlay),
-        // and TextWriter always pastes into the *current* focus — so writing
-        // without this check would select-all-replace whatever field happens to
-        // be focused, potentially destroying its contents.
-        //
-        // The overlay is a nonactivatingPanel (canBecomeKey = false), so clicking
-        // the Accept button never moves focus away from the target field, meaning
-        // the normal accept path is unaffected by this guard.
-        let liveElement = focusTracker.focusedElement()
-        guard let liveElement,
-              CFEqual(element, liveElement),
-              !focusTracker.isSecureTextField(liveElement),
-              focusTracker.isEditableTextField(liveElement) else {
-            // Focus has moved — silently dismiss rather than paste into the wrong field.
-            dismissOverlay()
-            return
+        // Determine what text to write: rephrase alternative (if showing) or the correction.
+        let textToWrite: String
+        if let alt = correctionEngine.currentAlternative {
+            textToWrite = alt
+        } else {
+            textToWrite = correctionEngine.correctionText
         }
+        guard !textToWrite.isEmpty else { return }
 
-        textWriter.write(corrected, to: element)
+        // Stash the pre-correction text for undo
+        undoText = focusTracker.value(of: element)
+        undoElement = element
+
+        textWriter.write(textToWrite, to: element)
+        SettingsStore.shared.recordAccepted()
+        statusBarController.flashUndoAvailable()
         overlayPanel?.orderOut(nil)
         correctionEngine.cancel()
+    }
+
+    private func copyCorrection() {
+        let text: String
+        if let alt = correctionEngine.currentAlternative {
+            text = alt
+        } else {
+            text = correctionEngine.correctionText
+        }
+        guard !text.isEmpty else { return }
+        textWriter.copyToClipboard(text)
+        dismissOverlay()
+    }
+
+    func undoLastCorrection() {
+        guard let element = undoElement, let text = undoText else { return }
+        textWriter.write(text, to: element)
+        undoText = nil
+        undoElement = nil
+        statusBarController.clearUndoAvailable()
     }
 
     private func dismissOverlay() {

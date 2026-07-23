@@ -25,6 +25,10 @@ final class EventTapController {
     private var runLoopSource: CFRunLoopSource?
 
     func start() {
+        attemptTapCreate(retriesLeft: 5)
+    }
+
+    private func attemptTapCreate(retriesLeft: Int) {
         let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
@@ -38,7 +42,18 @@ final class EventTapController {
             callback: tapCallback,
             userInfo: selfPtr
         ) else {
-            print("[EventTap] Failed — check Input Monitoring permission in System Settings.")
+            // CGEvent.tapCreate can transiently fail during startup even when
+            // Input Monitoring is already granted — most commonly when the TCC
+            // daemon hasn't finished processing the app's identity yet, or when
+            // a permission dialog is in-flight. Retry a few times with a short
+            // delay before giving up and showing the warning.
+            if retriesLeft > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    self?.attemptTapCreate(retriesLeft: retriesLeft - 1)
+                }
+            } else {
+                print("[EventTap] FAILED after all retries — check Input Monitoring in System Settings")
+            }
             return
         }
 
