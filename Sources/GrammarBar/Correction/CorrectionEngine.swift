@@ -49,6 +49,11 @@ final class CorrectionEngine: ObservableObject {
     // MARK: - Private
 
     private func beginCorrection(text: String) {
+        // Cancel any in-flight stream before starting a new one; without this,
+        // two calls to beginCorrection could both append tokens to correctionText.
+        currentTask?.cancel()
+        currentTask = nil
+
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard serverManager.isRunning else {

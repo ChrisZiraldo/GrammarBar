@@ -224,6 +224,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let element = currentFocusedElement else { return }
         let corrected = correctionEngine.correctionText
         guard !corrected.isEmpty else { return }
+
+        // Re-resolve the live focused element and verify it is still the same
+        // field we captured the correction for. Focus can silently drift if the
+        // user clicked elsewhere without typing (no keyDown → no dismissOverlay),
+        // and TextWriter always pastes into the *current* focus — so writing
+        // without this check would select-all-replace whatever field happens to
+        // be focused, potentially destroying its contents.
+        //
+        // The overlay is a nonactivatingPanel (canBecomeKey = false), so clicking
+        // the Accept button never moves focus away from the target field, meaning
+        // the normal accept path is unaffected by this guard.
+        let liveElement = focusTracker.focusedElement()
+        guard let liveElement,
+              CFEqual(element, liveElement),
+              !focusTracker.isSecureTextField(liveElement),
+              focusTracker.isEditableTextField(liveElement) else {
+            // Focus has moved — silently dismiss rather than paste into the wrong field.
+            dismissOverlay()
+            return
+        }
+
         textWriter.write(corrected, to: element)
         overlayPanel?.orderOut(nil)
         correctionEngine.cancel()

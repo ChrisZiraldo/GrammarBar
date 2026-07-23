@@ -13,6 +13,13 @@ final class LlamaServerManager: ObservableObject {
     private var healthCheckTimer: Timer?
     private var restartAttempts = 0
 
+    // Monotonically incremented every time we intentionally stop or start a new
+    // launch. Captured into terminationHandler and health-timer closures so that
+    // callbacks from a stale (already-replaced) process are silently ignored —
+    // preventing a dying old process from tearing down or restart-looping a
+    // healthy new one.
+    private var generation = 0
+
     // MARK: - Lifecycle
 
     func start(modelPath: String) async {
@@ -30,6 +37,11 @@ final class LlamaServerManager: ObservableObject {
     func stop() {
         healthCheckTimer?.invalidate()
         healthCheckTimer = nil
+        // Advance the generation before terminating so that the process's
+        // terminationHandler (which fires asynchronously after SIGTERM) sees a
+        // stale generation and does nothing — avoiding a spurious restart loop.
+        generation &+= 1
+        process?.terminationHandler = nil
         process?.terminate()
         process = nil
         isRunning = false
@@ -39,6 +51,12 @@ final class LlamaServerManager: ObservableObject {
     // MARK: - Private
 
     private func launch(modelPath: String) async {
+        // Stamp this launch attempt with the current generation so that the
+        // termination handler and health timer can identify themselves as stale
+        // if stop() or a subsequent launch() advances the counter first.
+        generation &+= 1
+        let gen = generation
+
         guard let serverURL = Bundle.main.url(forResource: "llama-server", withExtension: nil) else {
             statusMessage = "llama-server binary not found. Run scripts/setup.sh first."
             return
@@ -65,7 +83,8 @@ final class LlamaServerManager: ObservableObject {
 
         proc.terminationHandler = { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.handleUnexpectedTermination()
+                guard let self, gen == self.generation else { return }
+                self.handleUnexpectedTermination()
             }
         }
 
@@ -83,9 +102,12 @@ final class LlamaServerManager: ObservableObject {
         if healthy {
             isRunning = true
             statusMessage = "Running"
-            startHealthMonitor()
+            startHealthMonitor(generation: gen)
         } else {
             statusMessage = "Server failed to start (health check timed out)"
+            // Clear the handler before terminating so the dying process doesn't
+            // trigger handleUnexpectedTermination after we've already moved on.
+            proc.terminationHandler = nil
             proc.terminate()
             process = nil
         }
@@ -139,10 +161,13 @@ final class LlamaServerManager: ObservableObject {
         }
     }
 
-    private func startHealthMonitor() {
+    private func startHealthMonitor(generation gen: Int) {
+        // Invalidate any previous timer before creating a new one — without this,
+        // each crash/restart cycle accumulates an extra repeating timer.
+        healthCheckTimer?.invalidate()
         healthCheckTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, self.isRunning else { return }
+                guard let self, gen == self.generation, self.isRunning else { return }
                 let ok = await self.checkHealth()
                 if !ok {
                     self.isRunning = false
@@ -156,6 +181,11 @@ final class LlamaServerManager: ObservableObject {
         guard isRunning || process != nil else { return }
         isRunning = false
         process = nil
+
+        // Stop the health timer immediately; launch() will start a fresh one if
+        // the restart succeeds — preventing stale timers from accumulating.
+        healthCheckTimer?.invalidate()
+        healthCheckTimer = nil
 
         guard restartAttempts < 3, let path = currentModelPath else {
             statusMessage = "Server crashed. Open Settings to restart."

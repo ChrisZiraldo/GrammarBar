@@ -30,9 +30,16 @@ struct LlamaClient {
     // Streams corrected tokens for the given input text.
     func correct(_ text: String) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            // Wrap the SSE loop in a structured Task so that cancelling the
+            // stream (via continuation.onTermination) also stops the underlying
+            // URLSession byte stream — preventing stale generations from piling
+            // up on the single-threaded llama-server when the user keeps typing.
+            let streamTask = Task {
                 do {
-                    let url = URL(string: "http://127.0.0.1:\(self.port)/v1/chat/completions")!
+                    guard let url = URL(string: "http://127.0.0.1:\(self.port)/v1/chat/completions") else {
+                        continuation.finish(throwing: LlamaError.badStatus(-1))
+                        return
+                    }
                     var request = URLRequest(url: url, timeoutInterval: 30)
                     request.httpMethod = "POST"
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -77,6 +84,11 @@ struct LlamaClient {
                     continuation.finish(throwing: error)
                 }
             }
+
+            // When the consumer stops iterating (task cancelled, stream dropped,
+            // or normal completion), cancel the producer Task so the URLSession
+            // byte stream is torn down immediately rather than running to completion.
+            continuation.onTermination = { _ in streamTask.cancel() }
         }
     }
 }
