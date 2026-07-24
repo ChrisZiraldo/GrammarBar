@@ -69,7 +69,13 @@ while IFS= read -r -d '' lib; do
 done < <(find "$RES" -name "*.dylib" -print0)
 
 if [ -f "$RES/llama-server" ]; then
-  codesign --force --timestamp=none --options runtime -s "$SIGN_ID" "$RES/llama-server"
+  # llama-server runs as its own subprocess under hardened runtime. It must be
+  # signed WITH the entitlements (specifically disable-library-validation) so it
+  # can load its sibling ad-hoc-signed dylibs — otherwise library validation
+  # rejects them ("different Team IDs") and the server fails to start.
+  codesign --force --timestamp=none --options runtime \
+    --entitlements "$ENTITLEMENTS" \
+    -s "$SIGN_ID" "$RES/llama-server"
 fi
 
 # ── 4. Sign the app bundle last, with entitlements + hardened runtime ────────

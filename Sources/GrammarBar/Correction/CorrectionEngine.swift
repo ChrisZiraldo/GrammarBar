@@ -258,15 +258,21 @@ final class CorrectionEngine: ObservableObject {
             guard let self else { return }
             let client = LlamaClient(port: port, mode: mode, dictionary: dictionary)
             do {
+                // Accumulate the raw stream separately and show a display-cleaned
+                // version each token, so the "===GB-…===" fence never flashes in
+                // the overlay while it streams in (even partially).
+                var raw = ""
                 for try await token in client.correct(text) {
                     if Task.isCancelled { return }
-                    self.correctionText += token
+                    raw += token
+                    self.correctionText = Self.strippedForDisplay(raw)
                 }
                 if !Task.isCancelled {
-                    // Run the output through the sanitizer to strip preambles/wrappers
-                    // and reject clearly broken responses (e.g. prompt injection leakage).
+                    // Run the raw output through the sanitizer to strip preambles/
+                    // wrappers and reject clearly broken responses (e.g. prompt
+                    // injection leakage).
                     if let clean = Self.sanitize(
-                        output: self.correctionText,
+                        output: raw,
                         original: text,
                         mode: mode
                     ) {
@@ -308,6 +314,13 @@ final class CorrectionEngine: ObservableObject {
         mode: CorrectionMode
     ) -> String? {
         var text = output.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Strip GrammarBar's own anti-injection fence if the model echoed it
+        // back. Small models — especially in Proofread mode, where they're told
+        // to reproduce the text with the smallest possible edit — sometimes copy
+        // the trailing "===GB-XXXXXXXX===" marker (and occasionally the leading
+        // instruction line) verbatim into their answer.
+        text = stripInjectionFence(text)
 
         // Strip surrounding single/double quotes or backtick fences that the
         // model sometimes wraps the entire answer in.
@@ -369,6 +382,49 @@ final class CorrectionEngine: ObservableObject {
             }
         }
 
+        return text
+    }
+
+    /// Removes GrammarBar's own anti-injection fence — the "===GB-XXXXXXXX==="
+    /// markers (8 hex chars, random per request) and the accompanying
+    /// "…enclosed by the markers…" instruction line — that a model sometimes
+    /// echoes back into its output. Matches on the fixed shape since the nonce
+    /// itself varies per request.
+    private static func stripInjectionFence(_ input: String) -> String {
+        var text = input
+
+        // Drop the leading instruction line if it was echoed back.
+        if let range = text.range(
+            of: #"(?im)^.*enclosed by the markers.*$\n?"#,
+            options: .regularExpression
+        ) {
+            text.removeSubrange(range)
+        }
+
+        // Remove any standalone marker lines or inline marker tokens.
+        text = text.replacingOccurrences(
+            of: #"===GB-[0-9A-Fa-f]{8}==="#,
+            with: "",
+            options: .regularExpression
+        )
+
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Live-display cleanup used while streaming. Removes complete fence markers
+    /// (via `stripInjectionFence`) and additionally trims a *partial* trailing
+    /// marker still being emitted token-by-token (e.g. "===GB-64A7"), so the
+    /// fence never appears in the overlay before the final sanitize pass.
+    private static func strippedForDisplay(_ raw: String) -> String {
+        var text = stripInjectionFence(raw)
+        // Drop a trailing, still-incomplete fence marker. Only affects the live
+        // view; the final committed text comes from the strict `sanitize` pass.
+        if let range = text.range(
+            of: #"(?i)\s*=+(?:GB-?[0-9A-F]*=*)?$"#,
+            options: .regularExpression
+        ) {
+            text.replaceSubrange(range, with: "")
+        }
         return text
     }
 
