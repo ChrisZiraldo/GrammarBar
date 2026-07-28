@@ -164,10 +164,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         currentFocusedElement = element
 
-        let text = focusTracker.value(of: element) ?? ""
-        guard text.count >= 3 else { return }  // Skip trivially short strings
-
-        correctionEngine.schedule(text: text, bundleId: bundleId)
+        // The event tap runs before the frontmost app handles this key event.
+        // Read the AX value after the debounce instead of capturing a value that
+        // can still be one character behind.
+        correctionEngine.schedule(bundleId: bundleId) { [weak self] in
+            self?.focusTracker.value(of: element)
+        }
     }
 
     // MARK: - Return key handling

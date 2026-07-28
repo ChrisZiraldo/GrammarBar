@@ -61,6 +61,10 @@ final class CorrectionEngine: ObservableObject {
     /// The bundle ID of the frontmost app at the time `schedule` was called.
     /// Used to resolve per-app tone overrides.
     private var scheduledBundleId: String?
+    /// Reads the focused field only after typing has stopped. A key event reaches
+    /// GrammarBar before the target app updates its accessibility value, so
+    /// snapshotting during the event callback can omit the latest character.
+    private var scheduledTextProvider: (@MainActor () -> String?)?
 
     init(serverManager: LlamaServerManager) {
         self.serverManager = serverManager
@@ -69,17 +73,21 @@ final class CorrectionEngine: ObservableObject {
 
     // MARK: - Schedule / cancel
 
-    /// Called on every keystroke; resets the debounce window.
+    /// Called on every keystroke; resets the debounce window. The text provider
+    /// is evaluated when the window expires, after the target app has processed
+    /// the final key event.
     /// `bundleId` is the frontmost app's bundle ID, used to resolve per-app tone.
-    func schedule(text: String, bundleId: String?) {
+    func schedule(bundleId: String?, textProvider: @escaping @MainActor () -> String?) {
         // Cancel in-progress correction and any secondary requests immediately
         cancelAll()
 
         scheduledBundleId = bundleId
+        scheduledTextProvider = textProvider
         debouncer.delay = SettingsStore.shared.debounceInterval
         debouncer.schedule { [weak self] in
             Task { @MainActor [weak self] in
-                self?.beginCorrection(text: text)
+                guard let self, let text = self.scheduledTextProvider?() else { return }
+                self.beginCorrection(text: text)
             }
         }
     }
@@ -195,6 +203,7 @@ final class CorrectionEngine: ObservableObject {
         state = .idle
         originalText = ""
         correctionText = ""
+        scheduledTextProvider = nil
         rephraseState = .idle
         rephraseIndex = 0
         explanationState = .idle
@@ -202,7 +211,7 @@ final class CorrectionEngine: ObservableObject {
 
     private func beginCorrection(text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard trimmed.count >= 3 else { return }
         guard serverManager.isRunning else {
             state = .error("No model running — download one in Settings")
             return
