@@ -22,8 +22,8 @@ concurrency:
 
 jobs:
   release:
-    # macos-14 = Apple Silicon (arm64), which the bundled llama-server requires.
-    runs-on: macos-14
+    # macos-15 = Apple Silicon (arm64), which the bundled llama-server requires.
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
