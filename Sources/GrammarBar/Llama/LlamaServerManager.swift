@@ -75,6 +75,10 @@ final class LlamaServerManager: ObservableObject {
             "--port", "\(port)",
             "-ngl", "99",
             "-c", "4096",
+            // Single slot, and no host-RAM prompt cache. Newer llama.cpp defaults
+            // to --cache-ram 8192 (MiB), which lets the process balloon to ~7 GB.
+            "-np", "1",
+            "--cache-ram", "0",
             "--log-disable"
         ]
         // Suppress stdout/stderr from the subprocess
