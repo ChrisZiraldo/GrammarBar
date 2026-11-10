@@ -7,6 +7,8 @@ enum CorrectionState: Equatable {
     case idle
     case correcting
     case finished
+    /// The model returned the text unchanged — nothing to suggest, so the overlay stays hidden.
+    case unchanged
     case error(String)
 }
 
@@ -40,6 +42,23 @@ final class CorrectionEngine: ObservableObject {
     /// overridden on-the-fly for just this text via `applyMode(_:)`.
     @Published private(set) var activeMode: CorrectionMode = .standard
 
+    /// Ids (see `DiffChange.id`) of individual edits the user has reverted in the bubble.
+    @Published private(set) var rejectedChanges: Set<Int> = []
+
+    /// The correction with any reverted edits put back to the original wording.
+    /// Identical to `correctionText` when nothing has been reverted.
+    var finalCorrectionText: String {
+        guard !rejectedChanges.isEmpty else { return correctionText }
+        let segments = WordDiff.segments(original: originalText, corrected: correctionText)
+        return WordDiff.compose(segments, rejected: rejectedChanges)
+    }
+
+    /// What Accept / Copy should use: the selected rephrase alternative if one is
+    /// showing, otherwise the (possibly partially reverted) correction.
+    var textToApply: String {
+        currentAlternative ?? finalCorrectionText
+    }
+
     // MARK: Rephrase
 
     @Published private(set) var rephraseState: RephraseState = .idle
@@ -65,6 +84,10 @@ final class CorrectionEngine: ObservableObject {
     /// GrammarBar before the target app updates its accessibility value, so
     /// snapshotting during the event callback can omit the latest character.
     private var scheduledTextProvider: (@MainActor () -> String?)?
+
+    /// Text the user explicitly dismissed a suggestion for. It isn't re-suggested
+    /// until the field's text actually changes.
+    private var ignoredText: String?
 
     init(serverManager: LlamaServerManager) {
         self.serverManager = serverManager
@@ -96,6 +119,54 @@ final class CorrectionEngine: ObservableObject {
         cancelAll()
     }
 
+    /// Dismisses the current suggestion and remembers its text so the same
+    /// suggestion isn't brought straight back by the next pause in typing.
+    func dismissAndIgnore() {
+        if !originalText.isEmpty, state == .finished || state == .correcting {
+            ignoredText = originalText
+        }
+        cancelAll()
+    }
+
+    // MARK: - Per-change review
+
+    /// Reverts the edit with the given id to the original wording, or re-applies it.
+    func toggleChange(_ id: Int) {
+        guard state == .finished else { return }
+        if rejectedChanges.contains(id) {
+            rejectedChanges.remove(id)
+        } else {
+            rejectedChanges.insert(id)
+        }
+    }
+
+    /// Adds `word` to the custom dictionary and reverts every edit in the current
+    /// suggestion that touched it.
+    func protectWord(_ word: String) {
+        let core = DictionaryGuard.core(of: word)
+        guard !core.isEmpty else { return }
+
+        let settings = SettingsStore.shared
+        if !settings.customDictionary.contains(core) {
+            settings.customDictionary.append(core)
+        }
+
+        guard state == .finished else { return }
+        let segments = WordDiff.segments(original: originalText, corrected: correctionText)
+        for segment in segments {
+            guard case .change(let change) = segment.content,
+                  let original = change.original,
+                  DictionaryGuard.core(of: original) == core else { continue }
+            rejectedChanges.insert(change.id)
+        }
+    }
+
+    /// Re-runs the last correction after an error.
+    func retry() {
+        guard !originalText.isEmpty, serverManager.isRunning else { return }
+        runCorrection(mode: activeMode, recordStats: false)
+    }
+
     // MARK: - On-demand actions
 
     /// Request 3 rephrase alternatives for the current corrected text.
@@ -108,7 +179,7 @@ final class CorrectionEngine: ObservableObject {
         rephraseState = .loading
         rephraseIndex = 0
 
-        let text = correctionText
+        let text = finalCorrectionText
         let port = serverManager.port
 
         rephraseTask = Task { [weak self] in
@@ -203,6 +274,7 @@ final class CorrectionEngine: ObservableObject {
         state = .idle
         originalText = ""
         correctionText = ""
+        rejectedChanges = []
         scheduledTextProvider = nil
         rephraseState = .idle
         rephraseIndex = 0
@@ -212,6 +284,14 @@ final class CorrectionEngine: ObservableObject {
     private func beginCorrection(text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 3 else { return }
+
+        // The user dismissed a suggestion for exactly this text — leave it alone
+        // until they edit it.
+        if let ignoredText {
+            if ignoredText == trimmed { return }
+            self.ignoredText = nil
+        }
+
         guard serverManager.isRunning else {
             state = .error("No model running — download one in Settings")
             return
@@ -258,6 +338,7 @@ final class CorrectionEngine: ObservableObject {
         activeMode = mode
         state = .correcting
         correctionText = ""
+        rejectedChanges = []
 
         let text = originalText
         let port = serverManager.port
@@ -280,15 +361,29 @@ final class CorrectionEngine: ObservableObject {
                     // Run the raw output through the sanitizer to strip preambles/
                     // wrappers and reject clearly broken responses (e.g. prompt
                     // injection leakage).
-                    if let clean = Self.sanitize(
+                    if let sanitized = Self.sanitize(
                         output: raw,
                         original: text,
                         mode: mode
                     ) {
+                        // The model is only *asked* to leave dictionary words alone;
+                        // put back any it changed anyway.
+                        let clean = DictionaryGuard.restore(
+                            original: text,
+                            corrected: sanitized,
+                            dictionary: dictionary
+                        )
                         self.correctionText = clean
-                        self.state = .finished
-                        if recordStats {
-                            SettingsStore.shared.recordSuggestion()
+                        // For the automatic pass only: if the model changed nothing,
+                        // there's no suggestion worth interrupting the user with. An
+                        // explicit style change from the overlay always shows its result.
+                        if recordStats, TextComparison.isUnchanged(clean, from: text) {
+                            self.state = .unchanged
+                        } else {
+                            self.state = .finished
+                            if recordStats {
+                                SettingsStore.shared.recordSuggestion()
+                            }
                         }
                     } else {
                         // Output was empty or implausibly malformed — surface as an error
@@ -299,13 +394,28 @@ final class CorrectionEngine: ObservableObject {
                 }
             } catch {
                 if !Task.isCancelled {
-                    self.state = .error(error.localizedDescription)
+                    self.state = .error(Self.friendlyMessage(for: error))
                 }
             }
         }
     }
 
     // MARK: - Helpers
+
+    /// Turns low-level networking errors into something a person can act on.
+    private static func friendlyMessage(for error: Error) -> String {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut:
+                return "The model took too long to respond."
+            case .cannotConnectToHost, .networkConnectionLost, .cannotFindHost:
+                return "Can't reach the local model. It may still be starting."
+            default:
+                break
+            }
+        }
+        return error.localizedDescription
+    }
 
     /// Strips common leaked preambles and wrappers that small models sometimes
     /// prepend or append despite being told not to.

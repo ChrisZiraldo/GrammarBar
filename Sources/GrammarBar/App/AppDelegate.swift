@@ -25,8 +25,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     lazy var statusBarController = StatusBarController()
 
     private var overlayPanel: OverlayPanel?
+    private var onboardingController: OnboardingWindowController?
     private var currentFocusedElement: AXUIElement?
     private var cancellables = Set<AnyCancellable>()
+    private var permissionTimer: Timer?
 
     // MARK: - Undo state
 
@@ -34,6 +36,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var undoText: String?
     /// The element that was focused when the last correction was accepted.
     private var undoElement: AXUIElement?
+    /// Ctrl+Z stays available until this moment (or until the next keystroke), even
+    /// when the "Corrected" toast is turned off.
+    private var undoDeadline: Date?
+    private static let undoWindow: TimeInterval = 5
 
     // MARK: - Lifecycle
 
@@ -54,7 +60,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.handleReturnKey(ctrlHeld: ctrlHeld) ?? false
             }
         }
+        // Escape dismisses the bubble; Ctrl+Z undoes a just-accepted correction.
+        eventTapController.onEscapeKey = { [weak self] in
+            MainActor.assumeIsolated {
+                self?.handleEscapeKey() ?? false
+            }
+        }
+        eventTapController.onUndoKey = { [weak self] in
+            MainActor.assumeIsolated {
+                self?.handleUndoKey() ?? false
+            }
+        }
         eventTapController.start()
+        startPermissionWatcher()
 
         // Observe correction state changes to show/hide the overlay
         correctionEngine.$state
@@ -86,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        permissionTimer?.invalidate()
         eventTapController.stop()
         serverManager.stop()
     }
@@ -95,59 +114,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// GrammarBar's keystroke capture relies on Accessibility (to read/write focused
     /// text fields) and Input Monitoring (to tap key events system-wide). Neither
     /// permission auto-prompts just by calling CGEventTap/AXUIElement APIs — we have
-    /// to explicitly request them, and if still missing, send the user to System
-    /// Settings ourselves, since silently failing looks identical to "nothing broke."
+    /// to explicitly request them, and if still missing, guide the user through the
+    /// setup window, since silently failing looks identical to "nothing broke."
     private func ensurePermissions() {
-        let axTrusted = AXIsProcessTrustedWithOptions(
+        _ = AXIsProcessTrustedWithOptions(
             [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
         )
         if !CGPreflightListenEventAccess() {
             CGRequestListenEventAccess()
         }
 
-        // Both prompts (if shown) are async and the user may take a while to respond,
-        // so re-check shortly after instead of blocking startup on them.
-        guard !axTrusted || !CGPreflightListenEventAccess() else { return }
+        // The system prompts are async and the user may take a while to respond,
+        // so decide about the setup window shortly after instead of blocking startup.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.warnIfPermissionsMissing()
+            self?.showOnboardingIfNeeded()
         }
     }
 
-    private func warnIfPermissionsMissing() {
-        guard !AXIsProcessTrusted() || !CGPreflightListenEventAccess() else { return }
-
-        let alert = NSAlert()
-        alert.messageText = "GrammarBar needs two permissions"
-        alert.informativeText = """
-        To detect what you're typing and show suggestions, GrammarBar needs Accessibility \
-        and Input Monitoring access. Open System Settings → Privacy & Security, enable \
-        GrammarBar in both Accessibility and Input Monitoring, then relaunch GrammarBar.
-        """
-        alert.addButton(withTitle: "Open Accessibility Settings")
-        alert.addButton(withTitle: "Open Input Monitoring Settings")
-        alert.addButton(withTitle: "Later")
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            openSettingsPane("com.apple.preference.security?Privacy_Accessibility")
-        case .alertSecondButtonReturn:
-            openSettingsPane("com.apple.preference.security?Privacy_ListenEvent")
-        default:
-            break
+    /// Polls until both permissions are granted, starting the keystroke tap as soon as
+    /// Input Monitoring becomes available so the user never has to relaunch the app.
+    private func startPermissionWatcher() {
+        permissionTimer?.invalidate()
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkPermissionsAndRestartTap()
+            }
         }
     }
 
-    private func openSettingsPane(_ pane: String) {
-        guard let url = URL(string: "x-apple.systempreferences:\(pane)") else { return }
-        NSWorkspace.shared.open(url)
+    private func checkPermissionsAndRestartTap() {
+        if !eventTapController.isRunning && CGPreflightListenEventAccess() {
+            eventTapController.start()
+        }
+        if eventTapController.isRunning && AXIsProcessTrusted() {
+            permissionTimer?.invalidate()
+            permissionTimer = nil
+        }
+    }
+
+    // MARK: - Onboarding
+
+    private func showOnboardingIfNeeded() {
+        let permissionsOK = AXIsProcessTrusted() && CGPreflightListenEventAccess()
+        let hasModel = settings.selectedModelId != nil
+
+        // Already set up (e.g. an existing install) — nothing to show.
+        if permissionsOK && hasModel {
+            settings.hasCompletedOnboarding = true
+            return
+        }
+        // Show for first-timers, or whenever permissions have gone missing.
+        if !settings.hasCompletedOnboarding || !permissionsOK {
+            showOnboarding()
+        }
+    }
+
+    func showOnboarding() {
+        if onboardingController == nil {
+            onboardingController = OnboardingWindowController(serverManager: serverManager)
+        }
+        onboardingController?.show()
     }
 
     // MARK: - Keystroke handling
 
     private func handleKeystroke() {
-        guard settings.isEnabled else { return }
+        guard settings.isActive else { return }
 
         // Dismiss in-progress overlay and cancel any running stream — new typing context
         dismissOverlay()
+        // Typing on means Ctrl+Z belongs to the app again.
+        undoDeadline = nil
+        statusBarController.clearCorrectedFlash()
 
         let element = focusTracker.focusedElement()
         guard let element else { return }
@@ -172,14 +210,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Return key handling
+    // MARK: - Return / Escape / Undo key handling
 
     /// Returns whether the keystroke should be swallowed (kept from reaching the frontmost app).
     private func handleReturnKey(ctrlHeld: Bool) -> Bool {
-        guard settings.isEnabled else { return false }
+        guard settings.isActive else { return false }
 
         if ctrlHeld {
-            guard overlayPanel?.isVisible == true,
+            guard overlayPanel?.isShowing == true,
                   correctionEngine.state == .finished,
                   !correctionEngine.correctionText.isEmpty else {
                 return false // nothing ready to accept — let Ctrl+Return behave normally
@@ -192,6 +230,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // is left untouched so the app sends/inserts the user's original text as usual.
         dismissOverlay()
         return false
+    }
+
+    /// Escape closes the bubble (or the "Corrected" toast) and swallows the key; with
+    /// nothing showing it passes straight through.
+    private func handleEscapeKey() -> Bool {
+        guard let panel = overlayPanel, panel.isShowing else { return false }
+        if panel.isToastShowing {
+            panel.hide()
+        } else {
+            dismissAndIgnoreOverlay()
+        }
+        return true
+    }
+
+    /// Ctrl+Z undoes the last accepted correction, but only while the "Corrected"
+    /// toast is up — otherwise it belongs to whatever app has focus (e.g. a terminal).
+    private func handleUndoKey() -> Bool {
+        guard isUndoAvailable else { return false }
+        undoLastCorrection()
+        return true
+    }
+
+    /// True while the last accepted correction can still be undone: its toast or
+    /// menu-bar check is showing, or the short undo window hasn't run out.
+    var isUndoAvailable: Bool {
+        let inWindow = undoDeadline.map { Date() < $0 } ?? false
+        return (overlayPanel?.isToastShowing == true || inWindow)
+            && undoElement != nil && undoText != nil
     }
 
     // MARK: - Correction state → overlay
@@ -208,6 +274,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .finished:
             showOrPositionOverlay()
 
+        case .unchanged:
+            // Nothing to fix — take down the streaming bubble instead of showing an
+            // identical "suggestion".
+            overlayPanel?.hide()
+
         case .error:
             // Don't show overlay for errors — they appear in the overlay if it's already visible
             if overlayPanel?.isVisible == true {
@@ -216,23 +287,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Where the bubble should sit: above the focused text field when that option is
+    /// on and the field's position can be read, otherwise under the menu-bar icon.
+    private func placementTarget(nearTextField: Bool) -> OverlayPanel.PlacementTarget? {
+        if nearTextField,
+           let element = currentFocusedElement,
+           let rect = focusTracker.bubbleAnchorRect(for: element) {
+            return .textField(rect)
+        }
+        if let statusFrame = statusBarController.statusItemScreenFrame {
+            return .statusItem(statusFrame)
+        }
+        return nil
+    }
+
     private func showOrPositionOverlay() {
         if overlayPanel == nil {
             overlayPanel = OverlayPanel(
                 correctionEngine: correctionEngine,
                 onAccept: { [weak self] in self?.acceptCorrection() },
                 onCopy: { [weak self] in self?.copyCorrection() },
-                onDismiss: { [weak self] in self?.dismissOverlay() }
+                onDismiss: { [weak self] in self?.dismissAndIgnoreOverlay() },
+                onUndo: { [weak self] in self?.undoLastCorrection() }
             )
         }
 
-        if let statusFrame = statusBarController.statusItemScreenFrame {
-            overlayPanel?.position(belowStatusItem: statusFrame)
+        if let target = placementTarget(nearTextField: settings.anchorBubbleToTextField) {
+            overlayPanel?.place(target)
         }
 
-        if overlayPanel?.isVisible == false {
-            overlayPanel?.orderFront(nil)
-        }
+        overlayPanel?.present()
     }
 
     // MARK: - Accept / Copy / Dismiss / Undo
@@ -240,13 +324,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func acceptCorrection() {
         guard let element = currentFocusedElement else { return }
 
-        // Determine what text to write: rephrase alternative (if showing) or the correction.
-        let textToWrite: String
-        if let alt = correctionEngine.currentAlternative {
-            textToWrite = alt
-        } else {
-            textToWrite = correctionEngine.correctionText
-        }
+        // The selected rephrase alternative if one is showing, otherwise the
+        // correction with any edits the user reverted put back.
+        let textToWrite = correctionEngine.textToApply
         guard !textToWrite.isEmpty else { return }
 
         // Stash the pre-correction text for undo
@@ -255,18 +335,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         textWriter.write(textToWrite, to: element)
         SettingsStore.shared.recordAccepted()
-        statusBarController.flashUndoAvailable()
-        overlayPanel?.orderOut(nil)
         correctionEngine.cancel()
+
+        undoDeadline = Date().addingTimeInterval(Self.undoWindow)
+
+        // Collapse the bubble into a "Corrected · Undo" toast instead of vanishing —
+        // placed (or skipped) according to its own setting, separate from the bubble's.
+        switch settings.toastLocation {
+        case .menuBarIcon:
+            overlayPanel?.hide()
+            statusBarController.showCorrectedFlash(duration: Self.undoWindow)
+        case .off:
+            overlayPanel?.hide()
+        case .menuBar, .textField:
+            if let target = placementTarget(nearTextField: settings.toastLocation == .textField) {
+                overlayPanel?.place(target)
+            }
+            overlayPanel?.showUndoToast()
+        }
     }
 
     private func copyCorrection() {
-        let text: String
-        if let alt = correctionEngine.currentAlternative {
-            text = alt
-        } else {
-            text = correctionEngine.correctionText
-        }
+        let text = correctionEngine.textToApply
         guard !text.isEmpty else { return }
         textWriter.copyToClipboard(text)
         dismissOverlay()
@@ -277,11 +367,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         textWriter.write(text, to: element)
         undoText = nil
         undoElement = nil
-        statusBarController.clearUndoAvailable()
+        undoDeadline = nil
+        statusBarController.clearCorrectedFlash()
+        overlayPanel?.hide()
     }
 
+    /// Dismisses because the user kept typing or moved on.
     private func dismissOverlay() {
-        overlayPanel?.orderOut(nil)
+        overlayPanel?.hide()
         correctionEngine.cancel()
+    }
+
+    /// Dismisses because the user said "not this one" (close button / Escape), and
+    /// holds off re-suggesting until the text changes.
+    private func dismissAndIgnoreOverlay() {
+        overlayPanel?.hide()
+        correctionEngine.dismissAndIgnore()
     }
 }

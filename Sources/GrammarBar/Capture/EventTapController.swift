@@ -10,12 +10,25 @@ typealias KeystrokeHandler = @MainActor () -> Void
 // `false` to let it pass through untouched.
 typealias ReturnKeyHandler = (Bool) -> Bool
 
+// Called synchronously on the main thread for Escape. Return `true` to swallow it.
+typealias EscapeKeyHandler = () -> Bool
+
+// Called synchronously on the main thread for Control+Z. Return `true` to swallow it.
+typealias UndoKeyHandler = () -> Bool
+
 private let returnKeyCode: CGKeyCode = 36
 private let keypadEnterKeyCode: CGKeyCode = 76
+private let escapeKeyCode: CGKeyCode = 53
+private let zKeyCode: CGKeyCode = 6
 
 final class EventTapController {
     var onKeystroke: KeystrokeHandler?
     var onReturnKey: ReturnKeyHandler?
+    var onEscapeKey: EscapeKeyHandler?
+    var onUndoKey: UndoKeyHandler?
+
+    /// True while a (re)try sequence to create the tap is in flight.
+    private var isStarting = false
 
     /// Stamped onto CGEvents that GrammarBar posts itself (e.g. TextWriter's paste-replace
     /// fallback), so the tap callback can tell them apart from real user keystrokes.
@@ -24,7 +37,12 @@ final class EventTapController {
     private(set) var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
+    /// Whether the tap is installed and running.
+    var isRunning: Bool { tap != nil }
+
     func start() {
+        guard tap == nil, !isStarting else { return }
+        isStarting = true
         attemptTapCreate(retriesLeft: 5)
     }
 
@@ -52,11 +70,13 @@ final class EventTapController {
                     self?.attemptTapCreate(retriesLeft: retriesLeft - 1)
                 }
             } else {
+                isStarting = false
                 print("[EventTap] FAILED after all retries — check Input Monitoring in System Settings")
             }
             return
         }
 
+        isStarting = false
         tap = port
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
@@ -128,6 +148,25 @@ private func tapCallback(
                 return nil
             }
             return Unmanaged.passUnretained(event)
+        }
+
+        // Escape: dismiss the bubble if one is up (and keep the app from also seeing
+        // it); otherwise let it through without treating it as typing.
+        if keyCode == escapeKeyCode {
+            if let shouldConsume = controller.onEscapeKey?(), shouldConsume {
+                return nil
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
+        // Control+Z: undo the last accepted correction while the "Corrected" toast is up.
+        if keyCode == zKeyCode,
+           flags.contains(.maskControl),
+           !flags.contains(.maskCommand),
+           !flags.contains(.maskAlternate) {
+            if let shouldConsume = controller.onUndoKey?(), shouldConsume {
+                return nil
+            }
         }
 
         DispatchQueue.main.async {

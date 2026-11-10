@@ -93,6 +93,68 @@ final class FocusTracker {
         return CGRect(x: axPosition.x, y: appKitY, width: axSize.width, height: axSize.height)
     }
 
+    // Fields taller than this are treated as big editors, where the bubble should
+    // follow the cursor line instead of sitting above the whole editor.
+    private static let compactFieldMaxHeight: CGFloat = 160
+
+    // Where to attach the bubble when it floats near the text: the field itself for
+    // normal input boxes, or the cursor line for tall editors. AppKit coordinates.
+    // Returns nil when the app doesn't expose usable geometry.
+    func bubbleAnchorRect(for element: AXUIElement) -> CGRect? {
+        let field = screenBounds(of: element).flatMap { $0.width > 0 && $0.height > 0 ? $0 : nil }
+
+        if let field, field.height <= Self.compactFieldMaxHeight {
+            return field
+        }
+        if let caret = caretBounds(of: element) {
+            // Make sure the caret really belongs to this field before trusting it.
+            if let field {
+                let slack = field.insetBy(dx: -40, dy: -40)
+                if slack.contains(CGPoint(x: caret.midX, y: caret.midY)) { return caret }
+            } else {
+                return caret
+            }
+        }
+        return field
+    }
+
+    // Screen rect (AppKit coordinates) of the character just before the cursor, or
+    // of the selection. Nil if the app doesn't support AXBoundsForRange.
+    func caretBounds(of element: AXUIElement) -> CGRect? {
+        var rangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+              let rangeRef, CFGetTypeID(rangeRef) == AXValueGetTypeID()
+        else { return nil }
+
+        var range = CFRange()
+        guard AXValueGetValue(rangeRef as! AXValue, .cfRange, &range) else { return nil }
+
+        // A bare cursor has no width, so measure the character before it instead.
+        if range.length == 0 {
+            guard range.location > 0 else { return nil }
+            range = CFRange(location: range.location - 1, length: 1)
+        }
+
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+        var boundsRef: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXBoundsForRangeParameterizedAttribute as CFString,
+            rangeValue,
+            &boundsRef
+        ) == .success,
+              let boundsRef, CFGetTypeID(boundsRef) == AXValueGetTypeID()
+        else { return nil }
+
+        var rect = CGRect.zero
+        guard AXValueGetValue(boundsRef as! AXValue, .cgRect, &rect),
+              rect.height > 0, rect.width >= 0
+        else { return nil }
+
+        let screenHeight = NSScreen.screens.first?.frame.height ?? 0
+        return CGRect(x: rect.minX, y: screenHeight - rect.minY - rect.height, width: rect.width, height: rect.height)
+    }
+
     // Returns the bundle ID of the frontmost app.
     func frontmostAppBundleId() -> String? {
         NSWorkspace.shared.frontmostApplication?.bundleIdentifier
