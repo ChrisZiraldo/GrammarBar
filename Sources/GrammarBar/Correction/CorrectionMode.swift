@@ -105,7 +105,7 @@ enum CorrectionMode: String, CaseIterable, Codable, Identifiable {
         var prompt = systemPrompt + Self.injectionGuard
         if !dictionary.isEmpty {
             let terms = dictionary.joined(separator: ", ")
-            prompt += "\nNever change these words or terms — treat them as already correct: \(terms)."
+            prompt += "\nNever change these words or terms — treat them as already correct: \(terms). The only exception: capitalize the first letter of one of these words when it begins a sentence."
         }
         return prompt
     }

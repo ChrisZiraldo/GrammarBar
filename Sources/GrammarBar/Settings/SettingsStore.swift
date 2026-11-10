@@ -1,6 +1,26 @@
 import Foundation
 import Combine
 
+/// Where the post-accept "Corrected · Undo" toast is shown.
+enum ToastLocation: String, CaseIterable, Identifiable {
+    /// A green check on the menu-bar icon; click the icon to undo. No bubble at all.
+    case menuBarIcon
+    case menuBar
+    case textField
+    case off
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .menuBarIcon: return "Green check on the menu-bar icon"
+        case .menuBar:   return "Bubble under the menu-bar icon"
+        case .textField: return "Bubble next to the text field"
+        case .off:       return "Don't show"
+        }
+    }
+}
+
 final class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
 
@@ -28,6 +48,38 @@ final class SettingsStore: ObservableObject {
     /// scrolling internally within a fixed height.
     @Published var resizeBubbleToFitText: Bool {
         didSet { UserDefaults.standard.set(resizeBubbleToFitText, forKey: "resizeBubbleToFitText") }
+    }
+
+    /// When enabled, the bubble floats just above the focused text field instead of
+    /// hanging below the menu-bar icon.
+    @Published var anchorBubbleToTextField: Bool {
+        didSet { UserDefaults.standard.set(anchorBubbleToTextField, forKey: "anchorBubbleToTextField") }
+    }
+
+    /// Where the brief "Corrected · Undo" toast appears after you accept a suggestion.
+    @Published var toastLocation: ToastLocation {
+        didSet { UserDefaults.standard.set(toastLocation.rawValue, forKey: "toastLocation") }
+    }
+
+    // MARK: - Pause
+
+    /// When set and in the future, GrammarBar is temporarily paused (separate from `isEnabled`).
+    @Published var pausedUntil: Date? {
+        didSet { UserDefaults.standard.set(pausedUntil?.timeIntervalSince1970, forKey: "pausedUntil") }
+    }
+
+    var isPaused: Bool {
+        guard let pausedUntil else { return false }
+        return pausedUntil > Date()
+    }
+
+    /// Enabled and not paused — i.e. whether GrammarBar should be reacting to typing.
+    var isActive: Bool { isEnabled && !isPaused }
+
+    // MARK: - Onboarding
+
+    @Published var hasCompletedOnboarding: Bool {
+        didSet { UserDefaults.standard.set(hasCompletedOnboarding, forKey: "hasCompletedOnboarding") }
     }
 
     // MARK: - Correction mode
@@ -97,7 +149,18 @@ final class SettingsStore: ObservableObject {
         isEnabled = defaults.object(forKey: "isEnabled") as? Bool ?? true
         selectedModelId = defaults.string(forKey: "selectedModelId")
         debounceInterval = defaults.object(forKey: "debounceInterval") as? Double ?? 0.4
-        resizeBubbleToFitText = defaults.object(forKey: "resizeBubbleToFitText") as? Bool ?? false
+        // On by default: the fixed 100pt text area clips most paragraphs.
+        resizeBubbleToFitText = defaults.object(forKey: "resizeBubbleToFitText") as? Bool ?? true
+        anchorBubbleToTextField = defaults.object(forKey: "anchorBubbleToTextField") as? Bool ?? false
+        toastLocation = defaults.string(forKey: "toastLocation").flatMap(ToastLocation.init(rawValue:)) ?? .menuBarIcon
+        hasCompletedOnboarding = defaults.object(forKey: "hasCompletedOnboarding") as? Bool ?? false
+
+        if let until = defaults.object(forKey: "pausedUntil") as? Double {
+            let date = Date(timeIntervalSince1970: until)
+            pausedUntil = date > Date() ? date : nil
+        } else {
+            pausedUntil = nil
+        }
 
         // Migrate legacy proofreadOnly bool → correctionMode
         if let storedRaw = defaults.string(forKey: "correctionMode"),

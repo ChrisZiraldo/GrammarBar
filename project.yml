@@ -47,3 +47,22 @@ targets:
             chmod +x "$BINARY"
           fi
         basedOnDependencyAnalysis: false
+
+  # Unit tests for the pure text logic (diffing, dictionary enforcement). These
+  # compile the Foundation-only source files directly instead of hosting the app,
+  # so they run fast and don't need any permissions or a signed host binary.
+  GrammarBarTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: Tests/GrammarBarTests
+      - path: Sources/GrammarBar/Correction/WordDiff.swift
+      - path: Sources/GrammarBar/Correction/TextRules.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.grammarbar.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: NO

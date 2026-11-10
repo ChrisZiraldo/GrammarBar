@@ -3,23 +3,35 @@ import Combine
 import SwiftUI
 
 @MainActor
-final class StatusBarController {
+final class StatusBarController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var settingsWindow: NSWindow?
     private var serverManager: LlamaServerManager!
     private var correctionEngine: CorrectionEngine!
     private var settings: SettingsStore!
+    private var pulseTimer: Timer?
+    private var pulseFilled = false
+    private var showingNoChangesFlash = false
+    private var noChangesFlashWork: DispatchWorkItem?
+    private var showingCorrectedFlash = false
+    private var correctedFlashWork: DispatchWorkItem?
+    private var pauseExpiryTimer: Timer?
     private var appDelegate: AppDelegate? { NSApp.delegate as? AppDelegate }
     private var cancellables = Set<AnyCancellable>()
-    private var undoTimer: Timer?
+
+    /// The app that was frontmost when the menu opened (never GrammarBar itself),
+    /// used by the "Disable in <app>" shortcut.
+    private var menuTargetApp: (bundleId: String, name: String)?
 
     // Menu item tags
     private enum Tag: Int {
         case toggle = 100
+        case pause = 101
+        case appToggle = 102
+        case undo = 103
         case model = 200
         case serverStatus = 201
         case weekStats = 202
-        case undoItem = 300
     }
 
     /// Screen frame (AppKit coordinates, origin bottom-left) of the menu bar icon,
@@ -44,12 +56,22 @@ final class StatusBarController {
 
         buildMenu()
         observeChanges()
+        refreshIcon()
+        schedulePauseExpiry()
     }
 
     // MARK: - Menu construction
 
     private func buildMenu() {
         let menu = NSMenu()
+
+        // Undo the last accepted correction — only visible while undo is available.
+        let undoItem = NSMenuItem(title: "Undo Last Correction  (⌃Z)", action: #selector(undoLastCorrection), keyEquivalent: "")
+        undoItem.target = self
+        undoItem.tag = Tag.undo.rawValue
+        undoItem.image = NSImage(systemSymbolName: "arrow.uturn.backward", accessibilityDescription: nil)
+        undoItem.isHidden = true
+        menu.addItem(undoItem)
 
         // Enable / Disable toggle
         let toggleItem = NSMenuItem(
@@ -60,6 +82,19 @@ final class StatusBarController {
         toggleItem.target = self
         toggleItem.tag = Tag.toggle.rawValue
         menu.addItem(toggleItem)
+
+        // Pause for an hour (auto-resumes)
+        let pauseItem = NSMenuItem(title: pauseTitle(), action: #selector(togglePause), keyEquivalent: "")
+        pauseItem.target = self
+        pauseItem.tag = Tag.pause.rawValue
+        menu.addItem(pauseItem)
+
+        // Per-app shortcut — title and visibility are filled in when the menu opens.
+        let appItem = NSMenuItem(title: "Disable in This App", action: #selector(toggleAppBlock), keyEquivalent: "")
+        appItem.target = self
+        appItem.tag = Tag.appToggle.rawValue
+        appItem.isHidden = true
+        menu.addItem(appItem)
 
         menu.addItem(.separator())
 
@@ -99,18 +134,15 @@ final class StatusBarController {
 
         menu.addItem(.separator())
 
-        // Undo last correction (hidden until available)
-        let undoItem = NSMenuItem(title: "Undo Last Correction", action: #selector(undoLastCorrection), keyEquivalent: "z")
-        undoItem.keyEquivalentModifierMask = [.command]
-        undoItem.target = self
-        undoItem.tag = Tag.undoItem.rawValue
-        undoItem.isHidden = true
-        menu.addItem(undoItem)
-
         // Settings
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
+
+        // Setup guide (permissions, model, try-it)
+        let setupItem = NSMenuItem(title: "Setup Guide…", action: #selector(openSetupGuide), keyEquivalent: "")
+        setupItem.target = self
+        menu.addItem(setupItem)
 
         menu.addItem(.separator())
 
@@ -118,7 +150,51 @@ final class StatusBarController {
         let quitItem = NSMenuItem(title: "Quit GrammarBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitItem)
 
+        menu.delegate = self
         statusItem.menu = menu
+    }
+
+    // MARK: - NSMenuDelegate
+
+    nonisolated func menuWillOpen(_ menu: NSMenu) {
+        MainActor.assumeIsolated {
+            // The menu opens without activating GrammarBar, so the frontmost app is
+            // still the one the user was working in.
+            if let app = NSWorkspace.shared.frontmostApplication,
+               let bundleId = app.bundleIdentifier,
+               bundleId != Bundle.main.bundleIdentifier {
+                menuTargetApp = (bundleId, app.localizedName ?? bundleId)
+            } else {
+                menuTargetApp = nil
+            }
+            updateAppToggleItem()
+            updatePauseItem()
+            statusItem.menu?.item(withTag: Tag.undo.rawValue)?.isHidden = !(appDelegate?.isUndoAvailable ?? false)
+        }
+    }
+
+    private func updateAppToggleItem() {
+        guard let item = statusItem.menu?.item(withTag: Tag.appToggle.rawValue) else { return }
+        guard let target = menuTargetApp else {
+            item.isHidden = true
+            return
+        }
+        item.isHidden = false
+        item.title = settings.blockedBundleIds.contains(target.bundleId)
+            ? "Enable in \(target.name)"
+            : "Disable in \(target.name)"
+    }
+
+    private func updatePauseItem() {
+        statusItem.menu?.item(withTag: Tag.pause.rawValue)?.title = pauseTitle()
+    }
+
+    private func pauseTitle() -> String {
+        guard settings.isPaused, let until = settings.pausedUntil else { return "Pause for 1 Hour" }
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return "Resume (paused until \(formatter.string(from: until)))"
     }
 
     private func buildToneSubmenu() -> NSMenuItem {
@@ -148,7 +224,7 @@ final class StatusBarController {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] enabled in
                 self?.updateToggleItem(enabled: enabled)
-                self?.updateIcon(enabled: enabled)
+                self?.refreshIcon()
             }
             .store(in: &cancellables)
 
@@ -156,6 +232,24 @@ final class StatusBarController {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] message in
                 self?.updateStatusLabel(message)
+                self?.refreshIcon()
+            }
+            .store(in: &cancellables)
+
+        serverManager.$isRunning
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshIcon() }
+            .store(in: &cancellables)
+
+        correctionEngine.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                guard let self else { return }
+                if state == .unchanged {
+                    self.flashNoChanges()
+                } else {
+                    self.refreshIcon()
+                }
             }
             .store(in: &cancellables)
 
@@ -179,6 +273,42 @@ final class StatusBarController {
                 self?.updateWeekStats()
             }
             .store(in: &cancellables)
+
+        settings.$totalSuggestions
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateWeekStats() }
+            .store(in: &cancellables)
+
+        settings.$totalAccepted
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateWeekStats() }
+            .store(in: &cancellables)
+
+        settings.$pausedUntil
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updatePauseItem()
+                self?.schedulePauseExpiry()
+                self?.refreshIcon()
+            }
+            .store(in: &cancellables)
+    }
+
+    // MARK: - Pause
+
+    /// Resumes automatically when the pause window ends.
+    private func schedulePauseExpiry() {
+        pauseExpiryTimer?.invalidate()
+        pauseExpiryTimer = nil
+
+        guard let until = settings.pausedUntil, until > Date() else { return }
+        pauseExpiryTimer = Timer.scheduledTimer(withTimeInterval: until.timeIntervalSinceNow + 0.5, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if !self.settings.isPaused { self.settings.pausedUntil = nil }
+                self.refreshIcon()
+            }
+        }
     }
 
     // MARK: - Update helpers
@@ -188,10 +318,153 @@ final class StatusBarController {
         item.title = enabled ? "Disable GrammarBar" : "Enable GrammarBar"
     }
 
-    private func updateIcon(enabled: Bool) {
-        statusItem.button?.image = NSImage(systemSymbolName: "pencil.circle", accessibilityDescription: "GrammarBar")
-        statusItem.button?.image?.isTemplate = true
-        statusItem.button?.alphaValue = enabled ? 1.0 : 0.5
+    // MARK: - Icon state
+
+    private enum IconState {
+        case normal
+        case disabled
+        case paused
+        case serverDown
+        case correcting
+        case suggestionReady
+        case corrected
+        case noChanges
+    }
+
+    private func currentIconState() -> IconState {
+        if !settings.isEnabled { return .disabled }
+        if settings.isPaused { return .paused }
+
+        // Server problems matter more than transient activity — except while it's
+        // legitimately (re)starting, which isn't an error.
+        if !serverManager.isRunning {
+            let message = serverManager.statusMessage
+            let isStarting = message.hasPrefix("Starting") || message.hasPrefix("Restarting")
+            if !isStarting { return .serverDown }
+        }
+
+        switch correctionEngine.state {
+        case .correcting: return .correcting
+        case .finished:   return .suggestionReady
+        default:          break
+        }
+
+        if showingCorrectedFlash { return .corrected }
+        return showingNoChangesFlash ? .noChanges : .normal
+    }
+
+    /// Re-derives the menu-bar icon from the current enabled / server / correction state.
+    private func refreshIcon() {
+        guard let button = statusItem?.button else { return }
+        let state = currentIconState()
+
+        let symbol: String
+        let tooltip: String
+        var alpha: CGFloat = 1.0
+
+        switch state {
+        case .normal:
+            symbol = "pencil.circle"
+            tooltip = "GrammarBar"
+        case .disabled:
+            symbol = "pencil.slash"
+            tooltip = "GrammarBar is disabled"
+            alpha = 0.6
+        case .paused:
+            symbol = "pause.circle"
+            tooltip = "GrammarBar is paused"
+        case .serverDown:
+            symbol = "exclamationmark.triangle"
+            tooltip = "GrammarBar: \(serverManager.statusMessage)"
+        case .correcting:
+            // Alternates between outline and filled via the pulse timer.
+            symbol = pulseFilled ? "pencil.circle.fill" : "pencil.circle"
+            tooltip = "GrammarBar is checking your text…"
+        case .suggestionReady:
+            symbol = "pencil.circle.fill"
+            tooltip = "GrammarBar has a suggestion"
+        case .noChanges:
+            symbol = "checkmark.circle"
+            tooltip = "Looks good"
+        case .corrected:
+            symbol = "checkmark.circle.fill"
+            tooltip = "Corrected — click to undo"
+        }
+
+        var image = NSImage(systemSymbolName: symbol, accessibilityDescription: "GrammarBar")
+            ?? NSImage(systemSymbolName: "pencil.circle", accessibilityDescription: "GrammarBar")
+        if state == .corrected {
+            // Template images are tinted by the system; the confirmation needs real green.
+            let config = NSImage.SymbolConfiguration(paletteColors: [.systemGreen])
+            image = image?.withSymbolConfiguration(config)
+            image?.isTemplate = false
+        } else {
+            image?.isTemplate = true
+        }
+        button.image = image
+        button.alphaValue = alpha
+        button.toolTip = tooltip
+
+        if state == .correcting {
+            startPulse()
+        } else {
+            stopPulse()
+        }
+    }
+
+    private func startPulse() {
+        guard pulseTimer == nil else { return }
+        pulseTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.pulseFilled.toggle()
+                self.refreshIcon()
+            }
+        }
+    }
+
+    private func stopPulse() {
+        pulseTimer?.invalidate()
+        pulseTimer = nil
+        pulseFilled = false
+    }
+
+    /// Briefly shows a checkmark when a pass found nothing to fix.
+    private func flashNoChanges() {
+        showingNoChangesFlash = true
+        refreshIcon()
+
+        noChangesFlashWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.showingNoChangesFlash = false
+                self?.refreshIcon()
+            }
+        }
+        noChangesFlashWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    /// Shows a green check on the icon after a correction is accepted. Clicking the
+    /// icon then offers "Undo Last Correction".
+    func showCorrectedFlash(duration: TimeInterval) {
+        showingCorrectedFlash = true
+        refreshIcon()
+
+        correctedFlashWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in self?.clearCorrectedFlash() }
+        }
+        correctedFlashWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+
+    func clearCorrectedFlash() {
+        correctedFlashWork?.cancel()
+        correctedFlashWork = nil
+        guard showingCorrectedFlash else { return }
+        showingCorrectedFlash = false
+        refreshIcon()
     }
 
     private func updateStatusLabel(_ message: String) {
@@ -229,8 +502,12 @@ final class StatusBarController {
     }
 
     private func weekStatsTitle() -> String {
-        let n = settings.weekAccepted
-        return "Corrections this week: \(n)"
+        var title = "This week: \(settings.weekAccepted) accepted"
+        if settings.totalSuggestions > 0 {
+            let rate = Double(settings.totalAccepted) / Double(settings.totalSuggestions)
+            title += " · \(Int((min(rate, 1) * 100).rounded()))% acceptance"
+        }
+        return title
     }
 
     private func statusAttributedString(_ message: String) -> NSAttributedString {
@@ -240,38 +517,41 @@ final class StatusBarController {
         ])
     }
 
-    // MARK: - Undo affordance
-
-    /// Show the Undo menu item for 10 seconds, then hide it automatically.
-    func flashUndoAvailable() {
-        guard let item = statusItem.menu?.item(withTag: Tag.undoItem.rawValue) else { return }
-        item.isHidden = false
-        undoTimer?.invalidate()
-        undoTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.clearUndoAvailable() }
-        }
-    }
-
-    func clearUndoAvailable() {
-        undoTimer?.invalidate()
-        undoTimer = nil
-        statusItem.menu?.item(withTag: Tag.undoItem.rawValue)?.isHidden = true
-    }
-
     // MARK: - Actions
+
+    @objc private func undoLastCorrection() {
+        appDelegate?.undoLastCorrection()
+    }
 
     @objc private func toggleEnabled() {
         settings.isEnabled.toggle()
+    }
+
+    @objc private func togglePause() {
+        if settings.isPaused {
+            settings.pausedUntil = nil
+        } else {
+            settings.pausedUntil = Date().addingTimeInterval(60 * 60)
+        }
+    }
+
+    @objc private func toggleAppBlock() {
+        guard let target = menuTargetApp else { return }
+        if settings.blockedBundleIds.contains(target.bundleId) {
+            settings.blockedBundleIds.remove(target.bundleId)
+        } else {
+            settings.blockedBundleIds.insert(target.bundleId)
+        }
+    }
+
+    @objc private func openSetupGuide() {
+        appDelegate?.showOnboarding()
     }
 
     @objc private func setToneMode(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let mode = CorrectionMode(rawValue: raw) else { return }
         settings.correctionMode = mode
-    }
-
-    @objc private func undoLastCorrection() {
-        appDelegate?.undoLastCorrection()
     }
 
     @objc private func openSettings() {

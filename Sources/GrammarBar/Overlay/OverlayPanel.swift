@@ -13,15 +13,42 @@ final class BubbleGeometry: ObservableObject {
     // Horizontal position of the tail's apex, in the panel's own coordinate space.
     @Published var tailX: CGFloat = BubbleGeometry.panelWidth - 30
 
+    // True when the bubble floats above its anchor, so the tail points down from the
+    // bottom edge instead of up from the top edge.
+    @Published var tailOnBottom = false
+
     // Actual rendered height of the text area's content (including its own padding),
     // reported by SwiftUI via a GeometryReader. Used to size the bubble precisely so
     // long/bold/diff text is never clipped.
     @Published var measuredTextHeight: CGFloat = 40
+
+    // Rendered height of the whole bubble (tail included), also reported by SwiftUI.
+    // The panel is sized from this so every row — however many are showing — fits.
+    @Published var measuredTotalHeight: CGFloat = 0
+
+    // Drives the small slide when the bubble appears. The window itself fades via
+    // alphaValue (so its shadow fades too); this only nudges the content.
+    @Published var isShown = false
 }
 
-// MARK: - Preference key for measured text-content height
+// MARK: - Post-accept undo toast
+
+/// Drives the compact "Corrected · Undo" state the bubble collapses into after a
+/// correction is accepted.
+final class ToastModel: ObservableObject {
+    @Published var isShowing = false
+}
+
+// MARK: - Preference keys
 
 private struct TextContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct TotalHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
@@ -31,37 +58,64 @@ private struct TextContentHeightKey: PreferenceKey {
 // MARK: - Panel
 
 final class OverlayPanel: NSPanel {
+
+    /// What the bubble is attached to.
+    enum PlacementTarget {
+        /// The menu-bar icon: bubble hangs below it, tail pointing up.
+        case statusItem(CGRect)
+        /// A text field or cursor line: bubble floats above it, tail pointing down
+        /// (or below it, if there's no room above). Rect is in AppKit screen coordinates.
+        case textField(CGRect)
+    }
+
     private let correctionEngine: CorrectionEngine
     private let onAccept: () -> Void
     private let onCopy: () -> Void
     private let onDismiss: () -> Void
+    private let onUndo: () -> Void
     private let geometry = BubbleGeometry()
+    private let toast = ToastModel()
+    private var toastDismissWork: DispatchWorkItem?
+    /// Logical visibility: true from `present()` until `hide()`, even while a fade is in flight.
+    private var isPresented = false
+    /// Invalidates in-flight fade-out completions when the bubble is shown again.
+    private var visibilityToken = 0
     private let hostingView: NSHostingView<OverlayContentView>
     private var cancellables = Set<AnyCancellable>()
 
-    // Last status-item frame we were positioned against, and the horizontal
-    // origin computed from it. Retained so we can re-derive the panel's frame
-    // whenever its height changes without needing a fresh position() call.
-    private var anchorFrame: CGRect?
+    // Last placement we were positioned against, and the horizontal origin computed
+    // from it. Retained so we can re-derive the panel's frame whenever its height
+    // changes without needing a fresh place() call.
+    private var placement: PlacementTarget?
     private var originX: CGFloat = 0
+
+    /// True from `present()` until `hide()`.
+    var isShowing: Bool { isPresented }
+
+    /// True while the compact "Corrected · Undo" toast is what's showing.
+    var isToastShowing: Bool { isPresented && toast.isShowing }
 
     init(
         correctionEngine: CorrectionEngine,
         onAccept: @escaping () -> Void,
         onCopy: @escaping () -> Void,
-        onDismiss: @escaping () -> Void
+        onDismiss: @escaping () -> Void,
+        onUndo: @escaping () -> Void
     ) {
         self.correctionEngine = correctionEngine
         self.onAccept = onAccept
         self.onCopy = onCopy
         self.onDismiss = onDismiss
+        self.onUndo = onUndo
 
         let content = OverlayContentView(
             correctionEngine: correctionEngine,
             geometry: geometry,
+            toast: toast,
             onAccept: onAccept,
             onCopy: onCopy,
-            onDismiss: onDismiss
+            onDismiss: onDismiss,
+            onUndo: onUndo
         )
         let hostingView = NSHostingView(rootView: content)
         self.hostingView = hostingView
@@ -106,23 +160,116 @@ final class OverlayPanel: NSPanel {
             .sink { [weak self] _ in self?.relayout() }
             .store(in: &cancellables)
 
-        // Resize whenever SwiftUI reports a new rendered text height.
-        geometry.$measuredTextHeight
+        toast.$isShowing
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.relayout() }
+            .store(in: &cancellables)
+
+        // Resize whenever SwiftUI reports a new rendered height.
+        geometry.$measuredTotalHeight
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.relayout() }
             .store(in: &cancellables)
     }
 
-    /// Positions the bubble directly below the menu bar status item.
-    func position(belowStatusItem statusItemFrame: CGRect) {
+    // MARK: - Show / hide
+
+    /// Shows the bubble. Any leftover undo toast is cleared so a new suggestion
+    /// never opens in the collapsed "Corrected" state.
+    func present() {
+        if toast.isShowing { cancelToast() }
+        fadeIn()
+    }
+
+    /// Hides the bubble (and any undo toast) with a short fade.
+    func hide() {
+        cancelToast()
+        isPresented = false
+        guard isVisible else { return }
+
+        visibilityToken += 1
+        let token = visibilityToken
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.12
+            self.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            // Ignore if the bubble was re-presented while fading out.
+            guard let self, self.visibilityToken == token, !self.isPresented else { return }
+            self.orderOut(nil)
+            self.alphaValue = 1
+            self.geometry.isShown = false
+        })
+    }
+
+    /// Collapses the bubble into a compact "Corrected · Undo" toast that dismisses itself.
+    func showUndoToast(duration: TimeInterval = 5) {
+        toastDismissWork?.cancel()
+        toast.isShowing = true
+        fadeIn()
+
+        let work = DispatchWorkItem { [weak self] in self?.hide() }
+        toastDismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+
+    private func fadeIn() {
+        visibilityToken += 1
+        guard !isPresented else { return }
+        isPresented = true
+
+        // Start transparent and slightly offset, unless we're mid-fade-out, in which
+        // case just reverse from wherever the fade got to.
+        if !isVisible {
+            geometry.isShown = false
+            alphaValue = 0
+            orderFront(nil)
+        }
+
+        // Defer so SwiftUI renders the "hidden" state first and the slide animates.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isPresented else { return }
+            self.geometry.isShown = true
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                self.animator().alphaValue = 1
+            }
+        }
+    }
+
+    private func cancelToast() {
+        toastDismissWork?.cancel()
+        toastDismissWork = nil
+        toast.isShowing = false
+    }
+
+    // MARK: - Placement
+
+    /// Attaches the bubble to a menu-bar icon or a text field and repositions it.
+    func place(_ target: PlacementTarget) {
         let panelWidth = BubbleGeometry.panelWidth
-        let tailInsetFromRight: CGFloat = 30
-        let iconMidX = statusItemFrame.midX
 
-        var computedOriginX = iconMidX - (panelWidth - tailInsetFromRight)
-        var tailX = panelWidth - tailInsetFromRight
+        // Where the tail's apex should land, and how far from the panel's left edge.
+        let anchorX: CGFloat
+        let tailInsetFromLeft: CGFloat
+        let anchorRect: CGRect
 
-        if let screen = screenContaining(statusItemFrame) ?? NSScreen.main {
+        switch target {
+        case .statusItem(let frame):
+            anchorRect = frame
+            anchorX = frame.midX
+            tailInsetFromLeft = panelWidth - 30
+        case .textField(let rect):
+            anchorRect = rect
+            // A narrow rect is a cursor position; a wide one is a whole field, so
+            // point near its left end.
+            anchorX = rect.width < 60 ? rect.midX : rect.minX + 44
+            tailInsetFromLeft = 36
+        }
+
+        var computedOriginX = anchorX - tailInsetFromLeft
+        var tailX = tailInsetFromLeft
+
+        if let screen = screenContaining(anchorRect) ?? NSScreen.main {
             let visibleFrame = screen.visibleFrame
             let minX = visibleFrame.minX + 8
             let maxX = visibleFrame.maxX - panelWidth - 8
@@ -138,18 +285,54 @@ final class OverlayPanel: NSPanel {
         }
 
         geometry.tailX = tailX
-        anchorFrame = statusItemFrame
+        placement = target
         originX = computedOriginX
         relayout()
     }
 
     private func relayout() {
-        guard let anchorFrame else { return }
+        guard let placement else { return }
         let height = desiredHeight
-        let originY = anchorFrame.minY - height
+
+        let originY: CGFloat
+        var tailOnBottom = false
+
+        switch placement {
+        case .statusItem(let frame):
+            originY = frame.minY - height
+
+        case .textField(let rect):
+            let gap: CGFloat = 4
+            let visible = (screenContaining(rect) ?? NSScreen.main)?.visibleFrame
+            let aboveY = rect.maxY + gap
+
+            if let visible, aboveY + height > visible.maxY {
+                // No room above — drop below the field instead, tail pointing up.
+                originY = max(rect.minY - height - gap, visible.minY)
+            } else {
+                originY = aboveY
+                tailOnBottom = true
+            }
+        }
+
+        if geometry.tailOnBottom != tailOnBottom {
+            geometry.tailOnBottom = tailOnBottom
+        }
+
         let newFrame = NSRect(x: originX, y: originY, width: BubbleGeometry.panelWidth, height: height)
         guard newFrame != frame else { return }
-        setFrame(newFrame, display: true)
+
+        // Animate height changes while the bubble is on screen; position it
+        // instantly when it's hidden or just being placed.
+        if isPresented && isVisible {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                self.animator().setFrame(newFrame, display: true)
+            }
+        } else {
+            setFrame(newFrame, display: true)
+        }
     }
 
     // MARK: - Layout constants
@@ -160,8 +343,8 @@ final class OverlayPanel: NSPanel {
     static let minTextAreaHeight: CGFloat = 40
     static let maxTextAreaHeight: CGFloat = 300
 
-    /// Fixed chrome: tail + header + divider + outer padding.
-    private static let chromeHeight: CGFloat = BubbleGeometry.defaultHeight - 100
+    /// Toast row height (the panel itself is sized from the measured content).
+    static let toastRowHeight: CGFloat = 34
 
     // MARK: - Text measurement
 
@@ -176,41 +359,12 @@ final class OverlayPanel: NSPanel {
         return min(max(ceil(bounds.height) + textVPadding * 2, 30), 140)
     }
 
+    /// The panel is as tall as SwiftUI says the bubble is, plus the 4pt outer padding
+    /// on each side. Until the first measurement arrives, fall back to a default.
     private var desiredHeight: CGFloat {
-        let isFinished = correctionEngine.state == .finished
-            && !correctionEngine.correctionText.isEmpty
-
-        guard SettingsStore.shared.resizeBubbleToFitText else {
-            return BubbleGeometry.defaultHeight
-        }
-
-        // Use the actual rendered text height reported by SwiftUI, clamped to bounds.
-        let textAreaHeight = min(
-            max(geometry.measuredTextHeight, Self.minTextAreaHeight),
-            Self.maxTextAreaHeight
-        )
-
-        var extra: CGFloat = 0
-        if isFinished {
-            extra += 20  // readability row
-            extra += 38  // action row (copy / rephrase / why / accept)
-        }
-        if case .error = correctionEngine.state {
-            extra += 26
-        }
-
-        // Explanation area
-        switch correctionEngine.explanationState {
-        case .loading:
-            extra += 44  // divider + spinner row
-        case .finished(let text):
-            extra += 1   // divider
-            extra += Self.measuredExplanationHeight(for: text)
-        default:
-            break
-        }
-
-        return Self.chromeHeight + textAreaHeight + extra
+        let measured = geometry.measuredTotalHeight
+        guard measured > 0 else { return BubbleGeometry.defaultHeight }
+        return ceil(measured) + 8
     }
 
     private func screenContaining(_ rect: CGRect) -> NSScreen? {
@@ -221,62 +375,73 @@ final class OverlayPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-// MARK: - Word diff
+// MARK: - Wrapping layout (flows words like text, one view per word)
 
-struct DiffToken: Identifiable {
-    enum Kind { case same, removed, added }
-    let id = UUID()
-    let text: String
-    let kind: Kind
+private struct LineBreakCountKey: LayoutValueKey {
+    static let defaultValue = 0
 }
 
-enum WordDiff {
-    /// Compute a word-level diff between two strings using LCS.
-    static func compute(original: String, corrected: String) -> [DiffToken] {
-        let origWords = words(original)
-        let corrWords = words(corrected)
+private extension View {
+    /// Marks a zero-size view as a forced line break (count = number of "\n").
+    func lineBreak(_ count: Int) -> some View {
+        layoutValue(key: LineBreakCountKey.self, value: count)
+    }
+}
 
-        guard origWords != corrWords else {
-            return [DiffToken(text: corrected, kind: .same)]
-        }
+private struct WrapLayout: Layout {
+    var spacing: CGFloat = 3.5
+    var lineSpacing: CGFloat = 3
+    var emptyLineHeight: CGFloat = 16
 
-        let m = origWords.count
-        let n = corrWords.count
+    private func arrange(width: CGFloat, subviews: Subviews) -> (positions: [CGPoint], size: CGSize) {
+        var positions = [CGPoint](repeating: .zero, count: subviews.count)
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var maxX: CGFloat = 0
 
-        // Build LCS DP table
-        var dp = [[Int]](repeating: [Int](repeating: 0, count: n + 1), count: m + 1)
-        for i in 1...m {
-            for j in 1...n {
-                if origWords[i - 1].lowercased() == corrWords[j - 1].lowercased() {
-                    dp[i][j] = dp[i - 1][j - 1] + 1
-                } else {
-                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
-                }
+        for (index, subview) in subviews.enumerated() {
+            let breaks = subview[LineBreakCountKey.self]
+            if breaks > 0 {
+                y += (rowHeight > 0 ? rowHeight : emptyLineHeight) + lineSpacing
+                if breaks > 1 { y += CGFloat(breaks - 1) * (emptyLineHeight + lineSpacing) }
+                x = 0
+                rowHeight = 0
+                positions[index] = CGPoint(x: 0, y: y)
+                continue
             }
-        }
 
-        // Trace back through DP to build token list
-        var tokens: [DiffToken] = []
-        var i = m, j = n
-        while i > 0 || j > 0 {
-            if i > 0 && j > 0 && origWords[i - 1].lowercased() == corrWords[j - 1].lowercased() {
-                tokens.append(DiffToken(text: corrWords[j - 1], kind: .same))
-                i -= 1; j -= 1
-            } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
-                tokens.append(DiffToken(text: corrWords[j - 1], kind: .added))
-                j -= 1
-            } else {
-                tokens.append(DiffToken(text: origWords[i - 1], kind: .removed))
-                i -= 1
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0 && x + spacing + size.width > width {
+                y += rowHeight + lineSpacing
+                x = 0
+                rowHeight = 0
             }
+            if x > 0 { x += spacing }
+            positions[index] = CGPoint(x: x, y: y)
+            x += size.width
+            rowHeight = max(rowHeight, size.height)
+            maxX = max(maxX, x)
         }
 
-        return tokens.reversed()
+        let usedWidth = width.isFinite ? width : maxX
+        return (positions, CGSize(width: usedWidth, height: y + rowHeight))
     }
 
-    private static func words(_ text: String) -> [String] {
-        // Split on whitespace but keep punctuation attached to words
-        text.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        arrange(width: proposal.width ?? .infinity, subviews: subviews).size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let result = arrange(width: bounds.width, subviews: subviews)
+        for (index, subview) in subviews.enumerated() {
+            let point = result.positions[index]
+            subview.place(
+                at: CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y),
+                anchor: .topLeading,
+                proposal: .unspecified
+            )
+        }
     }
 }
 
@@ -287,6 +452,8 @@ private struct SpeechBubbleShape: Shape {
     var tailWidth: CGFloat = BubbleGeometry.tailWidth
     var tailHeight: CGFloat = BubbleGeometry.tailHeight
     var tailX: CGFloat
+    /// Draws the tail on the bottom edge (pointing down) instead of the top.
+    var tailAtBottom = false
 
     var animatableData: CGFloat {
         get { tailX }
@@ -312,7 +479,92 @@ private struct SpeechBubbleShape: Shape {
         path.addLine(to: CGPoint(x: bubble.minX, y: bubble.minY + r))
         path.addArc(center: CGPoint(x: bubble.minX + r, y: bubble.minY + r), radius: r, startAngle: .degrees(180), endAngle: .degrees(270), clockwise: false)
         path.closeSubpath()
-        return path
+
+        guard tailAtBottom else { return path }
+        // Mirror vertically so the tail hangs off the bottom edge.
+        return path.applying(CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: rect.minY + rect.maxY))
+    }
+}
+
+// MARK: - Pending text (original, dimmed, while the model works)
+
+private struct PendingTextView: View {
+    let text: String
+    let isWorking: Bool
+    @State private var pulse = false
+
+    var body: some View {
+        Text(text.isEmpty ? " " : text)
+            .font(.system(size: OverlayPanel.textFontSize))
+            .foregroundColor(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .opacity(isWorking ? (pulse ? 0.95 : 0.5) : 0.8)
+            .onAppear {
+                guard isWorking else { return }
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                    pulse = true
+                }
+            }
+    }
+}
+
+// MARK: - One reviewable edit in the diff
+
+private struct DiffChangeView: View {
+    let change: DiffChange
+    let isRejected: Bool
+    let onToggle: () -> Void
+    let onProtect: (String) -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        label
+            .font(.system(size: OverlayPanel.textFontSize))
+            .padding(.horizontal, 1)
+            .background(
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(hovering ? Color.accentColor.opacity(0.18) : Color.clear)
+            )
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+            .onTapGesture(perform: onToggle)
+            .contextMenu {
+                Button(isRejected ? "Apply this change" : "Keep my original") { onToggle() }
+                if let original = change.original {
+                    let core = DictionaryGuard.core(of: original)
+                    if !core.isEmpty {
+                        Button("Never change “\(core)”") { onProtect(original) }
+                    }
+                }
+            }
+            .help(isRejected ? "Reverted — click to apply this change again" : "Click to keep your original instead")
+    }
+
+    private var label: Text {
+        if isRejected {
+            if let original = change.original {
+                // Back to the user's own wording.
+                return Text(original).foregroundColor(.orange).underline()
+            }
+            // A rejected insertion: show what won't be added, struck through, so it
+            // can be clicked again.
+            return Text(change.corrected ?? "").foregroundColor(.secondary).strikethrough()
+        }
+
+        var result = Text("")
+        for (index, piece) in change.pieces.enumerated() {
+            if index > 0 && piece.spaceBefore { result = result + Text(" ") }
+            switch piece.kind {
+            case .same:
+                result = result + Text(piece.text)
+            case .added:
+                result = result + Text(piece.text).foregroundColor(.green).bold()
+            case .removed:
+                result = result + Text(piece.text).foregroundColor(.red).strikethrough()
+            }
+        }
+        return result
     }
 }
 
@@ -321,113 +573,95 @@ private struct SpeechBubbleShape: Shape {
 struct OverlayContentView: View {
     @ObservedObject var correctionEngine: CorrectionEngine
     @ObservedObject var geometry: BubbleGeometry
+    @ObservedObject var toast: ToastModel
     @ObservedObject private var settings = SettingsStore.shared
     let onAccept: () -> Void
     let onCopy: () -> Void
     let onDismiss: () -> Void
+    let onUndo: () -> Void
 
     var body: some View {
-        bubbleBody
-            .background {
-                SpeechBubbleShape(tailX: geometry.tailX)
-                    .fill(.regularMaterial)
+        Group {
+            if toast.isShowing {
+                toastBody
+            } else {
+                bubbleBody
             }
-            .clipShape(SpeechBubbleShape(tailX: geometry.tailX))
-            .overlay {
-                SpeechBubbleShape(tailX: geometry.tailX)
-                    .stroke(.separator, lineWidth: 0.5)
+        }
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: TotalHeightKey.self, value: proxy.size.height)
             }
-            .padding(4)
+        )
+        .onPreferenceChange(TotalHeightKey.self) { height in
+            geometry.measuredTotalHeight = height
+        }
+        .background {
+            SpeechBubbleShape(tailX: geometry.tailX, tailAtBottom: geometry.tailOnBottom)
+                .fill(.regularMaterial)
+        }
+        .clipShape(SpeechBubbleShape(tailX: geometry.tailX, tailAtBottom: geometry.tailOnBottom))
+        .overlay {
+            SpeechBubbleShape(tailX: geometry.tailX, tailAtBottom: geometry.tailOnBottom)
+                .stroke(.separator, lineWidth: 0.5)
+        }
+        .padding(4)
+        .offset(y: geometry.isShown ? 0 : (geometry.tailOnBottom ? 4 : -4))
+        .animation(.easeOut(duration: 0.18), value: geometry.isShown)
+    }
+
+    // MARK: - Tail spacing
+
+    private var tailTopPadding: CGFloat { geometry.tailOnBottom ? 0 : BubbleGeometry.tailHeight }
+    private var tailBottomPadding: CGFloat { geometry.tailOnBottom ? BubbleGeometry.tailHeight : 0 }
+
+    // MARK: - Undo toast
+
+    private var toastBody: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 13))
+                .foregroundColor(.green)
+
+            Text("Corrected")
+                .font(.system(size: 12, weight: .medium))
+
+            Spacer(minLength: 4)
+
+            Text("⌃Z")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+
+            Button("Undo") {
+                onUndo()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: OverlayPanel.toastRowHeight)
+        .padding(.top, tailTopPadding)
+        .padding(.bottom, tailBottomPadding)
+    }
+
+    // MARK: - Bubble
+
+    private var isFinishedWithText: Bool {
+        correctionEngine.state == .finished && !correctionEngine.correctionText.isEmpty
     }
 
     private var bubbleBody: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(correctionEngine.state == .correcting ? Color.orange : Color.green)
-                    .frame(width: 7, height: 7)
-                    .animation(.easeInOut(duration: 0.3), value: correctionEngine.state == .correcting)
-
-                Text(headerLabel)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-
-                Spacer(minLength: 4)
-
-                // Readability summary (when finished)
-                if correctionEngine.state == .finished,
-                   !correctionEngine.originalText.isEmpty {
-                    let r = Readability.analyse(correctionEngine.originalText)
-                    Text("\(r.wordCount) words · \(r.grade.rawValue)")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                        .layoutPriority(-1)
-                }
-
-                // On-the-fly style picker — changes this correction only, not global settings.
-                styleMenu
-
-                Button {
-                    onDismiss()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 8)
+            header
 
             Divider()
 
-            // Text area — diff when finished, plain while streaming
-            ScrollView {
-                Group {
-                    if case .finished(let alts) = correctionEngine.rephraseState,
-                       correctionEngine.rephraseIndex < alts.count {
-                        // Show current rephrase alternative as plain text
-                        Text(alts[correctionEngine.rephraseIndex])
-                            .font(.system(size: OverlayPanel.textFontSize))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                    } else if correctionEngine.state == .finished,
-                              !correctionEngine.originalText.isEmpty {
-                        // Show word-level diff
-                        diffTextView
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                    } else {
-                        // Streaming: plain text
-                        Text(correctionEngine.correctionText.isEmpty ? " " : correctionEngine.correctionText)
-                            .font(.system(size: OverlayPanel.textFontSize))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                    }
-                }
-                .padding(.horizontal, OverlayPanel.textHPadding)
-                .padding(.vertical, OverlayPanel.textVPadding)
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: TextContentHeightKey.self,
-                            value: proxy.size.height
-                        )
-                    }
-                )
-            }
-            .frame(height: settings.resizeBubbleToFitText ? textAreaHeight : 100)
-            .onPreferenceChange(TextContentHeightKey.self) { height in
-                geometry.measuredTextHeight = height
-            }
+            textArea
 
-            // Action footer row — visible only when finished
-            if correctionEngine.state == .finished && !correctionEngine.correctionText.isEmpty {
+            // Review footer — visible only when finished
+            if isFinishedWithText {
                 Divider()
+                readabilityRow
                 actionRow
             }
 
@@ -437,14 +671,112 @@ struct OverlayContentView: View {
             // Error row
             if case .error(let msg) = correctionEngine.state {
                 Divider()
-                Text(msg)
-                    .font(.system(size: 11))
-                    .foregroundColor(.red)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
+                errorRow(msg)
             }
         }
-        .padding(.top, BubbleGeometry.tailHeight)
+        .padding(.top, tailTopPadding)
+        .padding(.bottom, tailBottomPadding)
+    }
+
+    // MARK: - Header
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            statusIndicator
+
+            Text(headerLabel)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+
+            Spacer(minLength: 4)
+
+            // On-the-fly style picker — changes this correction only, not global settings.
+            styleMenu
+
+            Button {
+                onDismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss (Esc)")
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var statusIndicator: some View {
+        switch correctionEngine.state {
+        case .correcting:
+            ProgressView()
+                .scaleEffect(0.5)
+                .frame(width: 14, height: 14)
+        case .finished:
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 12))
+                .foregroundColor(.green)
+                .frame(width: 14, height: 14)
+        case .error:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundColor(.orange)
+                .frame(width: 14, height: 14)
+        default:
+            Circle()
+                .fill(Color.secondary.opacity(0.5))
+                .frame(width: 7, height: 7)
+                .frame(width: 14, height: 14)
+        }
+    }
+
+    // MARK: - Text area
+
+    private var textArea: some View {
+        ScrollView {
+            Group {
+                if case .finished(let alts) = correctionEngine.rephraseState,
+                   correctionEngine.rephraseIndex < alts.count {
+                    // Show current rephrase alternative as plain text
+                    Text(alts[correctionEngine.rephraseIndex])
+                        .font(.system(size: OverlayPanel.textFontSize))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                } else if correctionEngine.state == .finished,
+                          !correctionEngine.originalText.isEmpty {
+                    // Interactive word-level diff
+                    diffView
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .transition(.opacity)
+                } else {
+                    // Waiting on the model: the original text, dimmed
+                    PendingTextView(
+                        text: correctionEngine.originalText,
+                        isWorking: correctionEngine.state == .correcting
+                    )
+                    .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: correctionEngine.state == .finished)
+            .padding(.horizontal, OverlayPanel.textHPadding)
+            .padding(.vertical, OverlayPanel.textVPadding)
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: TextContentHeightKey.self,
+                        value: proxy.size.height
+                    )
+                }
+            )
+        }
+        .frame(height: settings.resizeBubbleToFitText ? textAreaHeight : 100)
+        .onPreferenceChange(TextContentHeightKey.self) { height in
+            geometry.measuredTextHeight = height
+        }
     }
 
     // MARK: - Style menu
@@ -477,40 +809,75 @@ struct OverlayContentView: View {
         .help("Change the correction style for this text only")
     }
 
-    // MARK: - Diff text view
+    // MARK: - Interactive diff
 
-    @ViewBuilder
-    private var diffTextView: some View {
-        let tokens = WordDiff.compute(
+    private var diffView: some View {
+        let segments = WordDiff.segments(
             original: correctionEngine.originalText,
             corrected: correctionEngine.correctionText
         )
-        diffText(tokens: tokens)
-            .font(.system(size: OverlayPanel.textFontSize))
-    }
-
-    private func diffText(tokens: [DiffToken]) -> Text {
-        tokens.reduce(Text("")) { result, token in
-            let word = token.text
-            let space = Text(" ")
-            switch token.kind {
-            case .same:
-                return result + Text(word) + space
-            case .added:
-                return result + Text(word).foregroundColor(.green).bold() + space
-            case .removed:
-                return result + Text(word).foregroundColor(.red).strikethrough() + space
+        return WrapLayout {
+            ForEach(segments) { segment in
+                segmentView(segment)
             }
         }
+    }
+
+    @ViewBuilder
+    private func segmentView(_ segment: DiffSegment) -> some View {
+        switch segment.content {
+        case .same(let text):
+            if WordDiff.isBreak(text) {
+                Color.clear
+                    .frame(width: 0, height: 0)
+                    .lineBreak(text.count)
+            } else {
+                Text(text)
+                    .font(.system(size: OverlayPanel.textFontSize))
+            }
+
+        case .change(let change):
+            DiffChangeView(
+                change: change,
+                isRejected: correctionEngine.rejectedChanges.contains(change.id),
+                onToggle: { correctionEngine.toggleChange(change.id) },
+                onProtect: { correctionEngine.protectWord($0) }
+            )
+        }
+    }
+
+    // MARK: - Readability
+
+    private var readabilityRow: some View {
+        let before = Readability.analyse(correctionEngine.originalText)
+        let after = Readability.analyse(correctionEngine.textToApply)
+        let summary = before.grade == after.grade
+            ? "\(after.wordCount) words · \(after.grade.rawValue)"
+            : "\(after.wordCount) words · \(before.grade.rawValue) → \(after.grade.rawValue)"
+
+        return HStack {
+            Text(summary)
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .help(String(
+                    format: "Flesch reading ease: %.0f → %.0f",
+                    before.fleschScore, after.fleschScore
+                ))
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 7)
     }
 
     // MARK: - Action row
 
     private var actionRow: some View {
         HStack(spacing: 6) {
-            Text("⌃Return to accept")
+            Text("⌃Return accept · Esc dismiss")
                 .font(.system(size: 10))
                 .foregroundColor(.secondary)
+                .lineLimit(1)
 
             Spacer()
 
@@ -592,6 +959,30 @@ struct OverlayContentView: View {
         }
     }
 
+    // MARK: - Error row
+
+    private func errorRow(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(message)
+                .font(.system(size: 11))
+                .foregroundColor(.red)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 4)
+
+            // Only possible once there's text to re-run (not for "no model" errors).
+            if !correctionEngine.originalText.isEmpty {
+                Button("Retry") {
+                    correctionEngine.retry()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
     // MARK: - Explanation view
 
     @ViewBuilder
@@ -628,6 +1019,7 @@ struct OverlayContentView: View {
             Text("Could not explain: \(msg)")
                 .font(.system(size: 11))
                 .foregroundColor(.red)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
         }
@@ -649,13 +1041,17 @@ struct OverlayContentView: View {
     private var headerLabel: String {
         switch correctionEngine.state {
         case .idle:        return "GrammarBar"
-        case .correcting:  return "Correcting…"
+        case .unchanged:   return "Looks good"
+        case .correcting:  return "Checking…"
         case .finished:
             if case .finished = correctionEngine.rephraseState {
                 return "Alternative \(correctionEngine.rephraseIndex + 1)"
             }
-            return "Suggested correction"
-        case .error:       return "Error"
+            let reverted = correctionEngine.rejectedChanges.count
+            return reverted > 0
+                ? "Suggested correction · \(reverted) reverted"
+                : "Suggested correction"
+        case .error:       return "Something went wrong"
         }
     }
 }
